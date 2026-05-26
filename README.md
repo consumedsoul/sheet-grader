@@ -21,10 +21,10 @@ Uses the OpenAI-compatible `chat/completions` format, so it works with
 OpenAI, OpenRouter, Together, Anyscale — anything that speaks that wire
 format. Just swap the endpoint, model name, and key.
 
-This was extracted from a real project ([entertainment-jobs-tracker](https://github.com/consumedsoul/entertainment-jobs-tracker))
-that uses the same pattern to rank LA entertainment crew job listings
-against a working actor/producer's profile. The generic version here strips
-out everything specific to that use case so you can point it at anything.
+This was extracted from a private project that uses the same pattern to
+rank LA entertainment crew job listings against a working actor/producer's
+profile. The generic version here strips out everything specific to that
+use case so you can point it at anything.
 
 ## When you'd use this instead of ChatGPT
 

@@ -337,8 +337,7 @@ function guessRowTitle_(row) {
  * titleOnly only check the row's title field.
  *
  * This is the cheap pre-filter -- catching obvious rejects here saves an API
- * call per match. On the original entertainment-jobs use case it auto-rejected
- * ~10% of rows with no LLM cost.
+ * call per match.
  */
 function checkExcludeKeywords_(row, excludeKeywords) {
   if (!excludeKeywords || excludeKeywords.length === 0) return null;
