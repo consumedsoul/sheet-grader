@@ -80,6 +80,9 @@ A few details worth knowing:
 - **Sleeps between API calls** (default 7s — tuned for Groq's free tier
   6K tokens/minute). Drop this if you're on a paid tier.
 - **One retry on HTTP 429** with a 5-second backoff.
+- **Won't double-grade on overlap.** A script lock means if a manual run
+  and a scheduled trigger fire at once, the second one exits immediately
+  rather than grading the same rows twice.
 - **Truncates long fields** in the prompt so token use stays predictable
   even if someone pastes a 50KB description into a cell.
 
@@ -100,7 +103,11 @@ You need a Google account and a free [Groq API key](https://console.groq.com)
 4. **Extensions → Apps Script.** This opens the script editor bound to
    your sheet.
 5. Delete the placeholder `Code.gs`. Create a new file called `Grader.gs`
-   and paste the contents of [Grader.js](Grader.js) into it.
+   and paste the contents of [Grader.js](Grader.js) into it. (The repo file
+   is named `Grader.js` so editors and tooling treat it as JavaScript; the
+   Apps Script editor uses the `.gs` extension. clasp handles this rename
+   automatically on push — when pasting manually, just name the editor file
+   `Grader.gs`.)
 6. In the Apps Script editor, **Project Settings (gear icon) → Script
    Properties → Add script property.** Set:
    - Name: `LLM_API_KEY`
@@ -163,14 +170,19 @@ shows up on a "best of LA" listicle unless it's also genuinely good.
 ```
 
 **`exclude_keywords` is your dealbreaker shortcut.** Comma-separated.
-Anything matching gets `F` instantly with no API call. Use `title:` as
-a prefix to only match a row's title field (useful when a body description
-might mention the keyword in a benign way, like "we are not an unpaid
-internship"). Example:
+Anything matching gets `F` instantly with no API call. Matching is
+whole-word and case-insensitive, so `intern` won't match `internal`. Use
+`title:` as a prefix to only match a row's title field (useful when a body
+description might mention the keyword in a benign way, like "we are not an
+unpaid internship"). Example:
 
 ```
 chain, fast casual, title:closed, title:permanently
 ```
+
+The comma is the only separator and there's no escape for it, so a single
+keyword can't contain a literal comma. Multi-word phrases without commas
+(`fast casual`) are fine.
 
 ## Schema
 
@@ -229,6 +241,12 @@ On purpose, to keep the example clean:
 - **No multi-model voting.** One model, one grade. If you need higher
   reliability, call this twice with different models and reconcile in
   your own code.
+- **Not hardened against prompt injection.** Row content is fenced in the
+  prompt and the model is told to treat it as data, not instructions, but
+  that's a mitigation, not a guarantee. A determined adversarial row could
+  still influence its own grade. Fine for triage; don't point it at a
+  hostile data source and trust the grades blindly. Results only ever land
+  in the sheet — the script takes no action on them.
 
 ## License
 
