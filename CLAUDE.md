@@ -86,3 +86,12 @@ is no test harness or runtime in this repo; correctness is reviewed by reading t
   `buildGradingPrompt_` **and** the regex in `parseGradeResponse_`.
 - Changing `updateRowGrade_`? It takes a `cols` object (`{ gradeCol, reasoningCol,
   statusCol }`), not three separate args.
+
+## Sync Policy (always — no prompting needed)
+
+After ANY code/content change, finish the session by syncing without being asked:
+
+1. `git add -A && git commit -m "<concise message>" && git push origin main`
+2. `clasp push` — git does NOT deploy Apps Script; both steps are required every time.
+
+Never leave work uncommitted, unpushed, or out of sync with the live script. Never wait for Hun to say "push/commit/sync".
