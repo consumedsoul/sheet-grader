@@ -75,7 +75,9 @@ is no test harness or runtime in this repo; correctness is reviewed by reading t
   don't trust grades from a hostile data source. Results only ever land in the sheet.
 - `exclude_keywords` splits on `,` with no escape, so a single keyword can't contain a
   literal comma. Documented in the README.
-- No automated tests and no runtime in this repo (Apps Script only runs bound to a sheet).
+- The pure helpers have a Node test harness (`npm test` / `node tests/run.js`); it stubs
+  the Apps Script globals and exercises the real `Grader.js` source. The Apps Script
+  *integration* (sheet I/O, API calls) has no runtime here — it only runs bound to a sheet.
 
 ## Safe-change checklist
 
@@ -89,9 +91,15 @@ is no test harness or runtime in this repo; correctness is reviewed by reading t
 
 ## Sync Policy (always — no prompting needed)
 
-After ANY code/content change, finish the session by syncing without being asked:
+This is a **portfolio/example repo with no live bound script** — git is the only
+deployment target. After ANY code/content change, finish the session by syncing
+without being asked:
 
-1. `git add -A && git commit -m "<concise message>" && git push origin main`
-2. `clasp push` — git does NOT deploy Apps Script; both steps are required every time.
+```
+git add -A && git commit -m "<concise message>" && git push origin main
+```
 
-Never leave work uncommitted, unpushed, or out of sync with the live script. Never wait for Hun to say "push/commit/sync".
+Never leave work uncommitted or unpushed, and never wait for Hun to say "push/commit/sync".
+Do **not** run or offer `clasp push` — there is no `.clasp.json` and no live script to
+deploy to. The `.clasp.json.example` / `.claspignore` files exist only to show how a
+consumer of this template would wire it up to their own sheet.

@@ -1,0 +1,10 @@
+{
+  "name": "sheet-grader",
+  "version": "1.0.0",
+  "description": "Generic LLM-based grader for Google Sheets rows (Google Apps Script).",
+  "private": true,
+  "scripts": {
+    "test": "node tests/run.js"
+  },
+  "license": "MIT"
+}

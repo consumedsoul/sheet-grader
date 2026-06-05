@@ -248,6 +248,19 @@ On purpose, to keep the example clean:
   hostile data source and trust the grades blindly. Results only ever land
   in the sheet — the script takes no action on them.
 
+## Development
+
+The pure helpers (keyword parsing, response parsing, whole-word exclude
+matching, row-title guessing) have a dependency-free Node test harness:
+
+```
+npm test        # or: node tests/run.js
+```
+
+It loads the real `Grader.js` into a sandbox with the Apps Script globals
+stubbed, so the assertions run against the actual source. The sheet I/O and
+API calls have no local runtime — those only run bound to a real spreadsheet.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

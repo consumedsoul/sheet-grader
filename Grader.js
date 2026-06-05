@@ -153,7 +153,14 @@ function gradeNewRows() {
     var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     var colMap = {};
     for (var h = 0; h < headers.length; h++) {
-      colMap[headers[h].toString().toLowerCase().trim()] = h + 1;
+      var key = headers[h].toString().toLowerCase().trim();
+      if (!key) continue;
+      // Duplicate header names collapse to the last column, which can silently
+      // route reads/writes to the wrong place. Warn so it's diagnosable.
+      if (colMap.hasOwnProperty(key)) {
+        Logger.log('WARNING: duplicate column header "' + key + '" -- using the rightmost (column ' + (h + 1) + ').');
+      }
+      colMap[key] = h + 1;
     }
 
     var cols = resolveColumns_(colMap);
