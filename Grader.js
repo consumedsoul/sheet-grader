@@ -72,6 +72,14 @@ var GRADER_CONFIG = {
   VALID_GRADES: ['A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D', 'F']
 };
 
+// Seeded into the Criteria sheet's exclude_keywords on first run. Kept as a
+// single hyphenated token (no commas) so it can never match real row content,
+// and detected as a sentinel in gradeNewRows so a user who fills in
+// criteria_text but forgets exclude_keywords doesn't auto-reject every row.
+var EXCLUDE_KEYWORDS_PLACEHOLDER =
+  'replace-with-your-dealbreaker-keywords (comma-separated; ' +
+  'a "title:" prefix matches only the row title)';
+
 // Placeholder text seeded into the Criteria sheet on first run.
 // Replace this in the sheet (not the code) so your prompt isn't in git.
 var DEFAULT_CRITERIA = {
@@ -87,9 +95,7 @@ var DEFAULT_CRITERIA = {
     'Describe what "match" means for your use case here. Be specific about ' +
     'what an A looks like vs a B vs an F -- the model will copy your standard.',
 
-  exclude_keywords:
-    'replace, these, with, your, dealbreakers, ' +
-    'title:also supports a "title:" prefix to only match the row title field'
+  exclude_keywords: EXCLUDE_KEYWORDS_PLACEHOLDER
 };
 
 
@@ -122,7 +128,15 @@ function gradeNewRows() {
 
     var criteria = getOrCreateCriteria_();
     var criteriaText = criteria.criteria_text || '';
-    var excludeKeywords = parseExcludeKeywords_(criteria.exclude_keywords || '');
+    var rawExcludeKeywords = criteria.exclude_keywords || '';
+    // Untouched placeholder => treat as no keywords. Without this, a user who
+    // edits criteria_text but leaves exclude_keywords as the seeded example
+    // would turn the example words into live filters and auto-reject every row.
+    if (rawExcludeKeywords.trim() === EXCLUDE_KEYWORDS_PLACEHOLDER) {
+      Logger.log('exclude_keywords is still the placeholder; treating as none.');
+      rawExcludeKeywords = '';
+    }
+    var excludeKeywords = parseExcludeKeywords_(rawExcludeKeywords);
     if (!criteriaText) {
       Logger.log('ERROR: criteria_text is empty. Edit the Criteria sheet.');
       return;
