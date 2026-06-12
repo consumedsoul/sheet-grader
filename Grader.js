@@ -152,19 +152,22 @@ function gradeNewRows() {
 
     var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     var colMap = {};
+    var dupKeys = {};
     for (var h = 0; h < headers.length; h++) {
       var key = headers[h].toString().toLowerCase().trim();
       if (!key) continue;
       // Duplicate header names collapse to the last column, which can silently
-      // route reads/writes to the wrong place. Warn so it's diagnosable.
+      // route reads/writes to the wrong place. Track them so resolveColumns_ can
+      // hard-fail on a duplicated *required* column and warn on the rest.
       if (colMap.hasOwnProperty(key)) {
+        dupKeys[key] = true;
         Logger.log('WARNING: duplicate column header "' + key + '" -- using the rightmost (column ' + (h + 1) + ').');
       }
       colMap[key] = h + 1;
     }
 
-    var cols = resolveColumns_(colMap);
-    if (!cols) return; // resolveColumns_ logs the specific missing-column error.
+    var cols = resolveColumns_(colMap, dupKeys);
+    if (!cols) return; // resolveColumns_ logs the specific missing/duplicate-column error.
 
     var rows = getUngradedRows_(sheet, headers, colMap);
     if (rows.length === 0) {
@@ -211,7 +214,8 @@ function gradeNewRows() {
  * Returns { gradeCol, reasoningCol, statusCol }, or null (after logging) if any
  * required column is missing from the Data sheet header.
  */
-function resolveColumns_(colMap) {
+function resolveColumns_(colMap, dupKeys) {
+  dupKeys = dupKeys || {};
   var cols = {
     gradeCol: colMap[GRADER_CONFIG.GRADE_COLUMN],
     reasoningCol: colMap[GRADER_CONFIG.REASONING_COLUMN],
@@ -221,6 +225,17 @@ function resolveColumns_(colMap) {
     Logger.log('ERROR: Data sheet must have columns: ' + GRADER_CONFIG.STATUS_COLUMN +
       ', ' + GRADER_CONFIG.GRADE_COLUMN + ', ' + GRADER_CONFIG.REASONING_COLUMN);
     return null;
+  }
+  // A duplicated required column collapses to the rightmost, so reads (status)
+  // and writes (grade/reasoning) could silently target the wrong column. Refuse
+  // to run rather than corrupt the sheet -- a warning isn't enough here.
+  var required = [GRADER_CONFIG.STATUS_COLUMN, GRADER_CONFIG.GRADE_COLUMN, GRADER_CONFIG.REASONING_COLUMN];
+  for (var r = 0; r < required.length; r++) {
+    if (dupKeys[required[r]]) {
+      Logger.log('ERROR: duplicate required column "' + required[r] +
+        '" -- rename the extra column so grades land in the right place. Aborting.');
+      return null;
+    }
   }
   return cols;
 }

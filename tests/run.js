@@ -33,6 +33,7 @@ var parseExcludeKeywords_ = sandbox.parseExcludeKeywords_;
 var parseGradeResponse_ = sandbox.parseGradeResponse_;
 var checkExcludeKeywords_ = sandbox.checkExcludeKeywords_;
 var guessRowTitle_ = sandbox.guessRowTitle_;
+var resolveColumns_ = sandbox.resolveColumns_;
 var EXCLUDE_KEYWORDS_PLACEHOLDER = sandbox.EXCLUDE_KEYWORDS_PLACEHOLDER;
 
 // --- Tiny assertion harness ------------------------------------------------
@@ -96,6 +97,18 @@ eq('prefers title', guessRowTitle_({ title: 'T', name: 'N', _row: 2 }), 'T');
 eq('falls back to name', guessRowTitle_({ name: 'N', body: 'B', _row: 2 }), 'N');
 eq('then first non-skipped column', guessRowTitle_({ status: 'new', body: 'B', _row: 2 }), 'B');
 eq('fallback to row number', guessRowTitle_({ status: 'new', _row: 7 }), 'row 7');
+
+// --- resolveColumns_ (presence + duplicate-required hard-fail) -------------
+eq('maps the three required columns',
+  resolveColumns_({ status: 1, grade: 2, reasoning: 3 }),
+  { gradeCol: 2, reasoningCol: 3, statusCol: 1 });
+eq('missing a required column -> null',
+  resolveColumns_({ status: 1, grade: 2 }), null);
+eq('duplicated required column (grade) hard-fails -> null',
+  resolveColumns_({ status: 1, grade: 2, reasoning: 3 }, { grade: true }), null);
+eq('duplicate of a non-required column does not hard-fail',
+  resolveColumns_({ status: 1, grade: 2, reasoning: 3 }, { body: true }),
+  { gradeCol: 2, reasoningCol: 3, statusCol: 1 });
 
 // --- placeholder sentinel regression guard ---------------------------------
 check('EXCLUDE_KEYWORDS_PLACEHOLDER has no comma (stays a single non-matching token)',
