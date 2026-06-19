@@ -28,7 +28,8 @@ is no test harness or runtime in this repo; correctness is reviewed by reading t
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_`, `parseExcludeKeywords_`, `getUngradedRows_`,
   `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`, `buildGradingPrompt_`,
-  `parseGradeResponse_`, `updateRowGrade_`.
+  `parseGradeResponse_`, `updateRowGrade_`, `buildRunLogRow_` / `appendRunLog_`
+  (end-of-run summary to the `Log` sheet, gated on `ENABLE_RUN_LOG`).
 
 ## Conventions
 

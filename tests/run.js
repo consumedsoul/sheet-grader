@@ -34,6 +34,8 @@ var parseGradeResponse_ = sandbox.parseGradeResponse_;
 var checkExcludeKeywords_ = sandbox.checkExcludeKeywords_;
 var guessRowTitle_ = sandbox.guessRowTitle_;
 var resolveColumns_ = sandbox.resolveColumns_;
+var buildRunLogRow_ = sandbox.buildRunLogRow_;
+var RUN_LOG_HEADERS = sandbox.RUN_LOG_HEADERS;
 var EXCLUDE_KEYWORDS_PLACEHOLDER = sandbox.EXCLUDE_KEYWORDS_PLACEHOLDER;
 
 // --- Tiny assertion harness ------------------------------------------------
@@ -109,6 +111,15 @@ eq('duplicated required column (grade) hard-fails -> null',
 eq('duplicate of a non-required column does not hard-fail',
   resolveColumns_({ status: 1, grade: 2, reasoning: 3 }, { body: true }),
   { gradeCol: 2, reasoningCol: 3, statusCol: 1 });
+
+// --- buildRunLogRow_ (run-summary row shaping) -----------------------------
+eq('run-log row matches header order + rounds elapsed',
+  buildRunLogRow_({ total: 10, graded: 7, rejected: 2, errors: 1, skipped: 0 },
+    '2026-06-18T00:00:00.000Z', 12.34),
+  ['2026-06-18T00:00:00.000Z', 10, 7, 2, 1, 0, 12.3]);
+eq('run-log row width equals header width',
+  buildRunLogRow_({ total: 0, graded: 0, rejected: 0, errors: 0, skipped: 0 }, 'x', 0).length,
+  RUN_LOG_HEADERS.length);
 
 // --- placeholder sentinel regression guard ---------------------------------
 check('EXCLUDE_KEYWORDS_PLACEHOLDER has no comma (stays a single non-matching token)',

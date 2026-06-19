@@ -208,6 +208,12 @@ Two rows:
 | `criteria_text` | Your rubric. |
 | `exclude_keywords` | Comma-separated dealbreaker words. |
 
+### Log sheet (auto-created on first run)
+
+Each run appends one summary row — `run_at`, `total`, `graded`, `rejected`,
+`errors`, `deferred`, `elapsed_sec` — so scheduled runs leave a trail without
+opening the execution log. Disable with `ENABLE_RUN_LOG: false`.
+
 ## Configuration
 
 Most things you'd want to change are in `GRADER_CONFIG` at the top of
@@ -223,6 +229,7 @@ Most things you'd want to change are in `GRADER_CONFIG` at the top of
   (already metadata, not content).
 - `MAX_FIELD_CHARS` — per-field truncation. Default 600. Bump up if
   your rows have important long-form content.
+- `ENABLE_RUN_LOG` — append a per-run summary to the `Log` sheet. Default on.
 
 ## What it doesn't do
 

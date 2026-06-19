@@ -47,6 +47,12 @@ var GRADER_CONFIG = {
   // Sheet names
   DATA_SHEET: 'Data',
   CRITERIA_SHEET: 'Criteria',
+  LOG_SHEET: 'Log',
+
+  // Append a one-line summary of each run (counts + elapsed) to the Log sheet,
+  // so unattended scheduled runs leave a trail without opening the execution log.
+  // Set false to disable. The Log sheet is created on first write.
+  ENABLE_RUN_LOG: true,
 
   // Required columns in the Data sheet
   STATUS_COLUMN: 'status',
@@ -197,9 +203,19 @@ function gradeNewRows() {
       }
     }
 
-    var totalElapsed = ((new Date() - startTime) / 1000).toFixed(1);
+    var totalElapsedSec = (new Date() - startTime) / 1000;
     Logger.log('=== Done: ' + stats.graded + ' graded, ' + stats.rejected + ' auto-rejected, ' +
-      stats.errors + ' errors, ' + stats.skipped + ' deferred in ' + totalElapsed + 's ===');
+      stats.errors + ' errors, ' + stats.skipped + ' deferred in ' + totalElapsedSec.toFixed(1) + 's ===');
+
+    // Best-effort run summary. Grades are already persisted per-row, so a Log
+    // sheet hiccup must not turn a successful run into a FATAL ERROR -- swallow it.
+    if (GRADER_CONFIG.ENABLE_RUN_LOG) {
+      try {
+        appendRunLog_(stats, startTime, totalElapsedSec);
+      } catch (logErr) {
+        Logger.log('WARNING: failed to write run log: ' + logErr.message);
+      }
+    }
 
   } catch (e) {
     Logger.log('FATAL ERROR: ' + e.message);
@@ -598,4 +614,47 @@ function updateRowGrade_(sheet, row, cols, grade, reasoning) {
   sheet.getRange(row, cols.gradeCol).setValue(grade);
   sheet.getRange(row, cols.reasoningCol).setValue(reasoning);
   sheet.getRange(row, cols.statusCol).setValue(GRADER_CONFIG.STATUS_GRADED);
+}
+
+
+// ============================================================================
+// RUN LOG
+// ============================================================================
+
+// Column order for the Log sheet. 'deferred' mirrors stats.skipped (rows left
+// status="new" when a run hits the timer budget and resumes next time).
+var RUN_LOG_HEADERS = ['run_at', 'total', 'graded', 'rejected', 'errors', 'deferred', 'elapsed_sec'];
+
+/**
+ * Shapes a stats object into a Log-sheet row in RUN_LOG_HEADERS order. Pure
+ * (no sheet I/O) so it can be unit-tested. runAt is a pre-formatted string;
+ * elapsedSec is rounded to one decimal.
+ */
+function buildRunLogRow_(stats, runAt, elapsedSec) {
+  return [
+    runAt,
+    stats.total,
+    stats.graded,
+    stats.rejected,
+    stats.errors,
+    stats.skipped,
+    Math.round(elapsedSec * 10) / 10
+  ];
+}
+
+/**
+ * Appends one summary row to the Log sheet, creating it (with a frozen, bold
+ * header) on first use. Append-only -- it never touches the Data sheet, so it
+ * can't affect timer-budget resumability or per-row crash safety.
+ */
+function appendRunLog_(stats, startTime, elapsedSec) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(GRADER_CONFIG.LOG_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(GRADER_CONFIG.LOG_SHEET);
+    sheet.getRange(1, 1, 1, RUN_LOG_HEADERS.length).setValues([RUN_LOG_HEADERS]);
+    sheet.getRange(1, 1, 1, RUN_LOG_HEADERS.length).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+  }
+  sheet.appendRow(buildRunLogRow_(stats, startTime.toISOString(), elapsedSec));
 }
