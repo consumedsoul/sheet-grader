@@ -29,12 +29,23 @@
 
 var GRADER_CONFIG = {
   // LLM API (OpenAI-compatible chat completions).
-  // Default: Groq Llama 3.1 8B Instant -- generous free tier (14,400 RPD).
+  // Default: Groq GPT OSS 20B -- generous free tier. This replaced
+  // llama-3.1-8b-instant, which Groq decommissioned on 2026-08-16 and named
+  // openai/gpt-oss-20b as its recommended successor.
   // To use OpenAI: 'https://api.openai.com/v1/chat/completions' + 'gpt-4o-mini'
   // To use OpenRouter: 'https://openrouter.ai/api/v1/chat/completions' + any model slug
   API_ENDPOINT: 'https://api.groq.com/openai/v1/chat/completions',
-  API_MODEL: 'llama-3.1-8b-instant',
+  API_MODEL: 'openai/gpt-oss-20b',
   API_KEY_PROPERTY: 'LLM_API_KEY', // stored via Project Settings > Script Properties
+
+  // Reasoning models (Groq's openai/gpt-oss-*) emit hidden reasoning tokens
+  // before the answer, and those tokens are billed against MAX_OUTPUT_TOKENS.
+  // 'low' keeps that overhead small -- grading against an explicit rubric needs
+  // little deliberation, and the saved budget goes to the actual reply.
+  // Set to '' (or null) for providers/models that reject the parameter; it is
+  // only sent when non-empty, so non-reasoning models are unaffected.
+  // Groq accepts 'low' | 'medium' | 'high' for gpt-oss (default 'medium').
+  REASONING_EFFORT: 'low',
 
   // Rate limiting between calls. 7s keeps Groq's free tier (6K TPM) happy.
   // Drop to 1000-2000ms for paid tiers.
@@ -70,9 +81,13 @@ var GRADER_CONFIG = {
   // Per-field truncation in the prompt to keep token usage predictable.
   MAX_FIELD_CHARS: 600,
 
-  // LLM generation settings
+  // LLM generation settings.
+  // MAX_OUTPUT_TOKENS is a ceiling on reasoning + visible output combined (it
+  // maps to max_completion_tokens). A reasoning model can spend the whole
+  // budget thinking and return empty/truncated content, which shows up as a
+  // parse error, so leave headroom above what the reply itself needs.
   TEMPERATURE: 0.3,
-  MAX_OUTPUT_TOKENS: 500,
+  MAX_OUTPUT_TOKENS: 1200,
 
   // Valid grades returned by the LLM. Anything else is treated as a parse failure.
   VALID_GRADES: ['A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D', 'F']
@@ -465,6 +480,11 @@ function callLlmApi_(apiKey, prompt) {
     'temperature': GRADER_CONFIG.TEMPERATURE,
     'max_tokens': GRADER_CONFIG.MAX_OUTPUT_TOKENS
   };
+  // Only sent when configured -- providers that don't know the parameter
+  // (or non-reasoning models) would reject or ignore it.
+  if (GRADER_CONFIG.REASONING_EFFORT) {
+    payload.reasoning_effort = GRADER_CONFIG.REASONING_EFFORT;
+  }
   var options = {
     'method': 'post',
     'headers': {
@@ -483,6 +503,15 @@ function callLlmApi_(apiKey, prompt) {
       try {
         var json = JSON.parse(response.getContentText());
         if (json.choices && json.choices[0] && json.choices[0].message) {
+          // Reasoning models put hidden reasoning in message.reasoning and the
+          // answer in message.content, so content stays the right field to read.
+          // But reasoning shares the token budget: if it exhausts the budget the
+          // call still returns 200 with empty/clipped content. Name that cause
+          // rather than letting it surface as a generic parse failure.
+          if (json.choices[0].finish_reason === 'length') {
+            Logger.log('  Response hit MAX_OUTPUT_TOKENS (' + GRADER_CONFIG.MAX_OUTPUT_TOKENS +
+              '). Raise it, or lower REASONING_EFFORT.');
+          }
           return json.choices[0].message.content;
         }
         Logger.log('  Unexpected response structure');
@@ -564,16 +593,22 @@ function buildGradingPrompt_(criteriaText, row) {
 /**
  * Extracts grade and reasoning from the model output. Returns null on any
  * parse failure or unrecognized grade -- caller logs the raw text for debugging.
+ *
+ * The label patterns tolerate markdown emphasis around the label ("**GRADE:** A",
+ * "**GRADE**: A") because instruction-tuned models often bold a label they were
+ * told to emit verbatim, and a stricter "GRADE:" match would throw away an
+ * otherwise perfectly good answer. Only the label is flexible -- the grade token
+ * itself is still validated against VALID_GRADES.
  */
 function parseGradeResponse_(responseText) {
   if (!responseText) return null;
 
-  var gradeMatch = responseText.match(/GRADE:\s*([A-Fa-f][+-]?)/);
+  var gradeMatch = responseText.match(/GRADE\**\s*:\s*\**\s*([A-Fa-f][+-]?)/);
   if (!gradeMatch) return null;
   var grade = gradeMatch[1].toUpperCase();
   if (GRADER_CONFIG.VALID_GRADES.indexOf(grade) === -1) return null;
 
-  var reasoningMatch = responseText.match(/REASONING:\s*([\s\S]+)/);
+  var reasoningMatch = responseText.match(/REASONING\**\s*:\s*\**\s*([\s\S]+)/);
   var reasoning = reasoningMatch ? reasoningMatch[1].trim() : 'No reasoning provided.';
   if (reasoning.length > 800) reasoning = reasoning.substring(0, 797) + '...';
 

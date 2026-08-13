@@ -73,6 +73,14 @@ eq('grade outside VALID_GRADES (E) -> null',
 eq('missing reasoning gets default',
   parseGradeResponse_('GRADE: B'),
   { grade: 'B', reasoning: 'No reasoning provided.' });
+// Markdown-bolded labels: models routinely emphasize a label they were told to
+// emit verbatim, and the payload is still valid.
+eq('bold label with colon inside the emphasis',
+  parseGradeResponse_('**GRADE:** A\n**REASONING:** Strong fit. Clear match.'),
+  { grade: 'A', reasoning: 'Strong fit. Clear match.' });
+eq('bold label with colon outside the emphasis',
+  parseGradeResponse_('**GRADE**: B-\n**REASONING**: Partial match. Some gaps.'),
+  { grade: 'B-', reasoning: 'Partial match. Some gaps.' });
 (function () {
   var long = 'GRADE: F\nREASONING: ' + new Array(1000).join('x');
   var out = parseGradeResponse_(long);

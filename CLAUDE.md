@@ -6,7 +6,7 @@ A single-file Google Apps Script (`Grader.js`) that grades rows of a Google Shee
 an LLM. Reads `status="new"` rows from a **Data** sheet, grades each against a rubric the
 user writes in a **Criteria** sheet, writes `grade` + `reasoning` back, flips status to
 `graded`. Provider-agnostic via the OpenAI-compatible `chat/completions` format (default:
-Groq Llama 3.1 8B).
+Groq GPT OSS 20B).
 
 This is a template/example repo meant to be copied into other people's sheets, so keep it
 generic and keep the README honest. It is not wired up to a live spreadsheet here — there
@@ -84,7 +84,9 @@ is no test harness or runtime in this repo; correctness is reviewed by reading t
 
 - Touching the loop? Preserve resumability (timer budget) and per-row writes, and keep the
   rate-limit sleep gated on `madeApiCall` so auto-rejects stay free.
-- Adding a provider? Only `API_ENDPOINT` / `API_MODEL` / key should need to change.
+- Adding a provider? Only `API_ENDPOINT` / `API_MODEL` / key should need to change —
+  plus `REASONING_EFFORT`, which is only sent when non-empty; blank it for providers
+  that reject the parameter.
 - Changing the grade scale? Update `VALID_GRADES` **and** the format string in
   `buildGradingPrompt_` **and** the regex in `parseGradeResponse_`.
 - Changing `updateRowGrade_`? It takes a `cols` object (`{ gradeCol, reasoningCol,

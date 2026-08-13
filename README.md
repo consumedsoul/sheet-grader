@@ -45,8 +45,8 @@ If you're going to grade two rows once, just use ChatGPT. This is for when:
   — Apps Script gives you triggers and a runtime for free.
 
 If your data is high-stakes (medical, legal, hiring decisions) — don't
-trust an 8B model's letter grade. Use this as a triage layer that decides
-what's worth your own attention, not as the final word.
+trust a small open-weight model's letter grade. Use this as a triage layer
+that decides what's worth your own attention, not as the final word.
 
 ## How it works
 
@@ -219,7 +219,14 @@ opening the execution log. Disable with `ENABLE_RUN_LOG: false`.
 Most things you'd want to change are in `GRADER_CONFIG` at the top of
 [Grader.js](Grader.js):
 
-- `API_ENDPOINT` / `API_MODEL` — switch providers or models here.
+- `API_ENDPOINT` / `API_MODEL` — switch providers or models here. Default is
+  Groq's `openai/gpt-oss-20b`.
+- `REASONING_EFFORT` — `low`/`medium`/`high` for reasoning models like
+  `openai/gpt-oss-*`. Default `low`; those models spend hidden reasoning
+  tokens out of `MAX_OUTPUT_TOKENS` before answering. Set to `''` for
+  providers that don't accept the parameter — it's only sent when non-empty.
+- `MAX_OUTPUT_TOKENS` — ceiling on reasoning **and** visible output together.
+  Too low and the reply gets clipped, which reads as a parse error.
 - `API_DELAY_MS` — sleep between calls. Lower on paid tiers.
 - `TIMER_BUDGET_SEC` — when to bail before the 6-minute Apps Script
   limit. Default 300s.
