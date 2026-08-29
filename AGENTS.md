@@ -1,4 +1,4 @@
-# CLAUDE.md — sheet-grader
+# AGENTS.md — sheet-grader
 
 ## What this is
 
@@ -9,8 +9,10 @@ user writes in a **Criteria** sheet, writes `grade` + `reasoning` back, flips st
 Groq GPT OSS 20B).
 
 This is a template/example repo meant to be copied into other people's sheets, so keep it
-generic and keep the README honest. It is not wired up to a live spreadsheet here — there
-is no test harness or runtime in this repo; correctness is reviewed by reading the code.
+generic and keep the README honest. It is not wired up to a live spreadsheet here, so the
+Apps Script integration (sheet I/O, API calls) only runs bound to a real sheet — but the
+pure helpers do have a Node test harness (`npm test` / `tests/run.js`) that exercises the
+real `Grader.js` source; run it after touching any parsing/filtering logic.
 
 ## Architecture (one file, top-down in `Grader.js`)
 
