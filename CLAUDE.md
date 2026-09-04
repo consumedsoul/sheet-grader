@@ -1,4 +1,4 @@
-# AGENTS.md — sheet-grader
+# CLAUDE.md — sheet-grader
 
 ## What this is
 
