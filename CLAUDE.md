@@ -1,5 +1,34 @@
 # CLAUDE.md — sheet-grader
 
+## Talking to Hun (read before you reply)
+
+Hun is a **vibe coder**, not a software engineer. He directs the work and judges the
+result; he does not read diffs or scroll back through a transcript to work out whether
+something is being asked of him. Write every response for him.
+
+**End EVERY response with exactly one status line — including short ones.**
+
+| Line | Use when |
+|---|---|
+| `✅ **Nothing needed from you.** <what changed>` | Done and verified. Pure FYI. |
+| `👉 **Your turn:** <the exact thing to do>` | He must run, click, paste, or check something. |
+| `❓ **Need your call:** <question + your recommendation>` | Blocked on a decision only he can make. |
+
+If that line is `👉` or `❓`, repeat it as the FIRST line of the response as well as the
+last. An ask buried in the middle is an ask he will miss.
+
+- `👉` must be literal and complete: the command to paste, the button to click, the URL
+  to open. Not "you may want to verify the deploy" — instead "open https://… and confirm
+  the hero image loads."
+- Never use `✅` when something is untested, partially done, or waiting on anything.
+  "I think it works" is `👉 Your turn: check X`.
+- `❓` always carries your recommendation, not just the question. He is choosing between
+  options you have already thought through, not doing the thinking from scratch.
+- Plain language. If a technical term is load-bearing, define it in the same sentence in
+  six words or fewer. Name the file, page, or button — not the abstraction.
+- Lead with what changed and what he can see. Reasoning and internals go below that, or
+  are left out unless he asks.
+
 ## What this is
 
 A single-file Google Apps Script (`Grader.js`) that grades rows of a Google Sheet with
