@@ -82,10 +82,13 @@ var GRADER_CONFIG = {
   MAX_FIELD_CHARS: 600,
 
   // LLM generation settings.
-  // MAX_OUTPUT_TOKENS is a ceiling on reasoning + visible output combined (it
-  // maps to max_completion_tokens). A reasoning model can spend the whole
-  // budget thinking and return empty/truncated content, which shows up as a
-  // parse error, so leave headroom above what the reply itself needs.
+  // MAX_OUTPUT_TOKENS is a ceiling on reasoning + visible output combined. It
+  // is sent on the wire as `max_tokens`, which Groq treats as an alias for
+  // `max_completion_tokens`; some newer reasoning-model endpoints (OpenAI's
+  // among them) accept only the newer name, so swapping the field in
+  // callLlmApi_ may be part of moving to one. A reasoning model can spend the
+  // whole budget thinking and return empty/truncated content, which shows up
+  // as a parse error, so leave headroom above what the reply itself needs.
   TEMPERATURE: 0.3,
   MAX_OUTPUT_TOKENS: 1200,
 
@@ -142,9 +145,11 @@ function gradeNewRows() {
 
   try {
     var apiKey = PropertiesService.getScriptProperties().getProperty(GRADER_CONFIG.API_KEY_PROPERTY);
+    // Config failures throw rather than return. Apps Script only sends its
+    // "your trigger failed" email when the trigger function throws, so a clean
+    // return here would let a revoked key repeat as a silent no-op forever.
     if (!apiKey) {
-      Logger.log('ERROR: No API key. Set ' + GRADER_CONFIG.API_KEY_PROPERTY + ' in Project Settings > Script Properties.');
-      return;
+      throw new Error('No API key. Set ' + GRADER_CONFIG.API_KEY_PROPERTY + ' in Project Settings > Script Properties.');
     }
 
     var criteria = getOrCreateCriteria_();
@@ -159,8 +164,13 @@ function gradeNewRows() {
     }
     var excludeKeywords = parseExcludeKeywords_(rawExcludeKeywords);
     if (!criteriaText) {
-      Logger.log('ERROR: criteria_text is empty. Edit the Criteria sheet.');
-      return;
+      // A run that just seeded the Criteria sheet is the documented setup step
+      // (README step 8), not a failure -- don't page the owner over it.
+      if (criteria._justCreated) {
+        Logger.log('Criteria sheet seeded. Fill in criteria_text, then run gradeNewRows again.');
+        return;
+      }
+      throw new Error('criteria_text is empty. Edit the Criteria sheet (column A key, column B value).');
     }
     Logger.log('Criteria loaded (' + criteriaText.length + ' chars), ' + excludeKeywords.length + ' exclude keywords');
 
@@ -188,7 +198,8 @@ function gradeNewRows() {
     }
 
     var cols = resolveColumns_(colMap, dupKeys);
-    if (!cols) return; // resolveColumns_ logs the specific missing/duplicate-column error.
+    // resolveColumns_ already logged the specific missing/duplicate-column error.
+    if (!cols) throw new Error('Data sheet columns could not be resolved -- see the log line above.');
 
     var rows = getUngradedRows_(sheet, headers, colMap);
     if (rows.length === 0) {
@@ -235,6 +246,11 @@ function gradeNewRows() {
   } catch (e) {
     Logger.log('FATAL ERROR: ' + e.message);
     Logger.log('Stack: ' + e.stack);
+    // Rethrow so Apps Script marks the execution as failed and emails the
+    // trigger owner. Swallowing it makes every broken run look successful,
+    // which is exactly the failure an unattended tool must not hide. The
+    // finally block still releases the lock on the way out.
+    throw e;
   } finally {
     lock.releaseLock();
   }
@@ -342,7 +358,9 @@ function getOrCreateCriteria_() {
     sheet.setColumnWidth(2, 600);
     Logger.log('Criteria sheet created. Edit criteria_text and exclude_keywords, then run gradeNewRows again.');
     // Return empty so the caller bails before grading rows against placeholder rules.
-    return { criteria_text: '', exclude_keywords: '' };
+    // _justCreated marks this as the expected first-run setup step rather than a
+    // misconfiguration, so the caller can bail quietly instead of throwing.
+    return { criteria_text: '', exclude_keywords: '', _justCreated: true };
   }
 
   var lastRow = sheet.getLastRow();

@@ -64,6 +64,13 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   (`callLlmApi_`).
 - **Overlap guard:** `gradeNewRows` takes a `LockService` script lock so a manual run and
   a trigger can't double-grade the same rows.
+- **Failures must throw.** Apps Script emails the trigger owner only when the trigger
+  function throws, so config failures (missing key, empty `criteria_text`, unresolvable
+  columns) `throw` and the top-level catch logs *then* rethrows. Never convert one back
+  to a clean `return` — that makes a broken unattended run look successful. Genuinely
+  empty states still return normally: no Data sheet rows, nothing with `status="new"`,
+  and the first run that seeds the Criteria sheet (flagged `_justCreated` by
+  `getOrCreateCriteria_`, since README step 8 tells the user to expect it).
 
 ## Required Script Properties
 
@@ -86,9 +93,11 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
 
 - Touching the loop? Preserve resumability (timer budget) and per-row writes, and keep the
   rate-limit sleep gated on `madeApiCall` so auto-rejects stay free.
-- Adding a provider? Only `API_ENDPOINT` / `API_MODEL` / key should need to change —
+- Adding a provider? Usually only `API_ENDPOINT` / `API_MODEL` / key need to change —
   plus `REASONING_EFFORT`, which is only sent when non-empty; blank it for providers
-  that reject the parameter.
+  that reject the parameter. One exception: `MAX_OUTPUT_TOKENS` goes out as
+  `max_tokens`, and newer reasoning-model endpoints accept only
+  `max_completion_tokens` — rename it in `callLlmApi_` if a swap 400s on that.
 - Changing the grade scale? Update `VALID_GRADES` **and** the format string in
   `buildGradingPrompt_` **and** the regex in `parseGradeResponse_`.
 - Changing `updateRowGrade_`? It takes a `cols` object (`{ gradeCol, reasoningCol,

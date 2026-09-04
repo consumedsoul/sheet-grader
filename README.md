@@ -19,7 +19,9 @@ It's two stages:
 Uses the OpenAI-compatible `chat/completions` format, so it works with
 [Groq](https://console.groq.com) (default, has a generous free tier),
 OpenAI, OpenRouter, Together, Anyscale — anything that speaks that wire
-format. Just swap the endpoint, model name, and key.
+format. Usually you just swap the endpoint, model name, and key — see
+[Configuration](#configuration) for the one exception (newer reasoning-model
+endpoints and the `max_tokens` field name).
 
 This was extracted from a private project that uses the same pattern to
 rank LA entertainment crew job listings against a working actor/producer's
@@ -214,6 +216,13 @@ Each run appends one summary row — `run_at`, `total`, `graded`, `rejected`,
 `errors`, `deferred`, `elapsed_sec` — so scheduled runs leave a trail without
 opening the execution log. Disable with `ENABLE_RUN_LOG: false`.
 
+A run that dies outright — no API key, a blank `criteria_text` on an existing
+Criteria sheet, missing or duplicated required columns, an unhandled exception —
+writes **no** Log row. It throws instead, so Apps Script marks the execution
+failed and emails the trigger owner. A gap in the Log sheet means a broken run,
+not a quiet one. (Setup step 8 — the first run that *creates* the Criteria
+sheet — is expected, and exits quietly.)
+
 ## Configuration
 
 Most things you'd want to change are in `GRADER_CONFIG` at the top of
@@ -226,7 +235,11 @@ Most things you'd want to change are in `GRADER_CONFIG` at the top of
   tokens out of `MAX_OUTPUT_TOKENS` before answering. Set to `''` for
   providers that don't accept the parameter — it's only sent when non-empty.
 - `MAX_OUTPUT_TOKENS` — ceiling on reasoning **and** visible output together.
-  Too low and the reply gets clipped, which reads as a parse error.
+  Too low and the reply gets clipped, which reads as a parse error. Sent on the
+  wire as `max_tokens` (Groq treats it as an alias for `max_completion_tokens`).
+  Some newer reasoning-model endpoints — OpenAI's `o*`/`gpt-5*` among them —
+  reject `max_tokens` and accept only `max_completion_tokens`; if a provider
+  swap fails on that, rename the field in `callLlmApi_`.
 - `API_DELAY_MS` — sleep between calls. Lower on paid tiers.
 - `TIMER_BUDGET_SEC` — when to bail before the 6-minute Apps Script
   limit. Default 300s.
