@@ -60,6 +60,12 @@ var GRADER_CONFIG = {
   CRITERIA_SHEET: 'Criteria',
   LOG_SHEET: 'Log',
 
+  // Header names for the two Criteria sheet columns. The sheet is located by
+  // these names, not by position, so inserting a column to their left doesn't
+  // silently make the rubric unreadable (see parseCriteriaValues_).
+  CRITERIA_KEY_HEADER: 'field',
+  CRITERIA_VALUE_HEADER: 'value',
+
   // Append a one-line summary of each run (counts + elapsed) to the Log sheet,
   // so unattended scheduled runs leave a trail without opening the execution log.
   // Set false to disable. The Log sheet is created on first write.
@@ -70,8 +76,11 @@ var GRADER_CONFIG = {
   GRADE_COLUMN: 'grade',
   REASONING_COLUMN: 'reasoning',
 
-  // Status values
-  STATUS_NEW: 'new',
+  // Status values. A row is picked up by a run when its status is one of
+  // STATUSES_TO_GRADE, and stamped STATUS_GRADED once written back. "regrade"
+  // exists so you can re-run rows against a revised rubric by typing one word
+  // in the status cell, instead of resetting each row to "new" by hand.
+  STATUSES_TO_GRADE: ['new', 'regrade'],
   STATUS_GRADED: 'graded',
 
   // Columns to skip when building the prompt (already metadata, not content
@@ -170,7 +179,16 @@ function gradeNewRows() {
         Logger.log('Criteria sheet seeded. Fill in criteria_text, then run gradeNewRows again.');
         return;
       }
-      throw new Error('criteria_text is empty. Edit the Criteria sheet (column A key, column B value).');
+      // Name the keys actually found. The common cause is an inserted column or a
+      // renamed header, where the rubric is present but read from the wrong place --
+      // "criteria_text is empty" on its own points at the wrong thing.
+      var foundKeys = criteria._keys || [];
+      throw new Error('criteria_text is empty on the ' + GRADER_CONFIG.CRITERIA_SHEET + ' sheet. ' +
+        'Expected a "' + GRADER_CONFIG.CRITERIA_KEY_HEADER + '"/"' + GRADER_CONFIG.CRITERIA_VALUE_HEADER +
+        '" header row with a criteria_text row beneath it. ' +
+        (foundKeys.length
+          ? 'Keys found instead: ' + foundKeys.join(', ') + '.'
+          : 'No key/value rows were readable -- check the header row names and that nothing was inserted to their left.'));
     }
     Logger.log('Criteria loaded (' + criteriaText.length + ' chars), ' + excludeKeywords.length + ' exclude keywords');
 
@@ -340,7 +358,8 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
 
 /**
  * Reads the Criteria sheet. Creates it with placeholders if missing.
- * Returns { criteria_text: '...', exclude_keywords: '...' }.
+ * Returns { criteria_text: '...', exclude_keywords: '...', _keys: [...] }, where
+ * _keys lists the keys actually found (used to explain an empty criteria_text).
  */
 function getOrCreateCriteria_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -360,26 +379,73 @@ function getOrCreateCriteria_() {
     // Return empty so the caller bails before grading rows against placeholder rules.
     // _justCreated marks this as the expected first-run setup step rather than a
     // misconfiguration, so the caller can bail quietly instead of throwing.
-    return { criteria_text: '', exclude_keywords: '', _justCreated: true };
+    return { criteria_text: '', exclude_keywords: '', _keys: [], _justCreated: true };
   }
 
   var lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return { criteria_text: '', exclude_keywords: '' };
+  var lastCol = sheet.getLastColumn();
+  if (lastRow <= 1 || lastCol < 2) return { criteria_text: '', exclude_keywords: '', _keys: [] };
 
-  var data = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+  // Read the header row too -- parseCriteriaValues_ uses it to find the key and
+  // value columns by name rather than assuming they're still A and B.
+  return parseCriteriaValues_(sheet.getRange(1, 1, lastRow, lastCol).getValues());
+}
+
+/**
+ * Turns the Criteria sheet's raw 2D values (header row included) into a
+ * { key: value } map, plus a `_keys` list of the keys it saw for error messages.
+ *
+ * The key and value columns are located by header name
+ * (GRADER_CONFIG.CRITERIA_KEY_HEADER / CRITERIA_VALUE_HEADER), matching how the
+ * Data sheet resolves its columns. Inserting a column to the left of `field`
+ * used to shift both keys out of view and surface as a misleading "criteria_text
+ * is empty" error while the rubric sat one column over.
+ *
+ * Falls back to the first two columns when either header is missing, so a sheet
+ * whose header row was renamed or deleted keeps working as before.
+ */
+function parseCriteriaValues_(values) {
   var criteria = {};
-  for (var i = 0; i < data.length; i++) {
-    var key = data[i][0].toString().trim();
-    var val = data[i][1].toString().trim();
-    if (key) criteria[key] = val;
+  var keys = [];
+  if (!values || values.length < 2) {
+    criteria._keys = keys;
+    return criteria;
   }
+
+  var header = values[0];
+  var keyCol = -1;
+  var valCol = -1;
+  for (var c = 0; c < header.length; c++) {
+    var h = header[c] === null || header[c] === undefined ? '' : header[c].toString().toLowerCase().trim();
+    if (keyCol === -1 && h === GRADER_CONFIG.CRITERIA_KEY_HEADER) keyCol = c;
+    else if (valCol === -1 && h === GRADER_CONFIG.CRITERIA_VALUE_HEADER) valCol = c;
+  }
+  if (keyCol === -1 || valCol === -1) {
+    keyCol = 0;
+    valCol = 1;
+  }
+
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+    var key = row[keyCol] === null || row[keyCol] === undefined ? '' : row[keyCol].toString().trim();
+    if (!key) continue;
+    var val = row[valCol] === null || row[valCol] === undefined ? '' : row[valCol].toString().trim();
+    criteria[key] = val;
+    keys.push(key);
+  }
+  // Assigned last so a row literally keyed "_keys" can't shadow the list the
+  // caller's error message reads.
+  criteria._keys = keys;
   return criteria;
 }
 
 /**
- * Parses a comma-separated keyword string into [{ text, titleOnly }, ...].
+ * Parses a comma-separated keyword string into [{ text, titleOnly, pattern }, ...].
  * A "title:" prefix means the keyword only matches against the title field
  * (see guessRowTitle_), useful for avoiding false positives in body text.
+ *
+ * The whole-word matcher is compiled once here rather than per row, since
+ * checkExcludeKeywords_ runs this list against every row in the batch.
  */
 function parseExcludeKeywords_(csvString) {
   if (!csvString) return [];
@@ -391,12 +457,26 @@ function parseExcludeKeywords_(csvString) {
     if (kw.indexOf('title:') === 0) {
       var text = kw.slice(6).trim();
       if (!text) continue;
-      result.push({ text: text, titleOnly: true });
+      result.push(buildExcludeKeyword_(text, true));
     } else {
-      result.push({ text: kw, titleOnly: false });
+      result.push(buildExcludeKeyword_(kw, false));
     }
   }
   return result;
+}
+
+/**
+ * One parsed exclude keyword, with its whole-word matcher pre-compiled. The
+ * word boundaries are what keep "intern" from matching "internal"; the escape
+ * keeps a keyword containing regex punctuation (e.g. "node.js") literal.
+ */
+function buildExcludeKeyword_(text, titleOnly) {
+  var escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return {
+    text: text,
+    titleOnly: titleOnly,
+    pattern: new RegExp('\\b' + escaped + '\\b', 'i')
+  };
 }
 
 
@@ -405,8 +485,17 @@ function parseExcludeKeywords_(csvString) {
 // ============================================================================
 
 /**
- * Returns row objects with status = "new", each tagged with a _row property
- * pointing to its 1-based sheet row number.
+ * True when a row's raw status cell means "grade this row" -- i.e. it matches
+ * one of GRADER_CONFIG.STATUSES_TO_GRADE once trimmed and lowercased.
+ */
+function isGradableStatus_(rawStatus) {
+  var s = rawStatus === null || rawStatus === undefined ? '' : rawStatus.toString().trim().toLowerCase();
+  return GRADER_CONFIG.STATUSES_TO_GRADE.indexOf(s) !== -1;
+}
+
+/**
+ * Returns row objects whose status is gradable (see isGradableStatus_), each
+ * tagged with a _row property pointing to its 1-based sheet row number.
  */
 function getUngradedRows_(sheet, headers, colMap) {
   var lastRow = sheet.getLastRow();
@@ -417,8 +506,7 @@ function getUngradedRows_(sheet, headers, colMap) {
   var rows = [];
 
   for (var i = 0; i < data.length; i++) {
-    var statusVal = data[i][statusIdx].toString().trim().toLowerCase();
-    if (statusVal === GRADER_CONFIG.STATUS_NEW) {
+    if (isGradableStatus_(data[i][statusIdx])) {
       var row = {};
       for (var j = 0; j < headers.length; j++) {
         row[headers[j].toString().trim().toLowerCase()] = data[i][j];
@@ -457,7 +545,8 @@ function guessRowTitle_(row) {
  * titleOnly only check the row's title field.
  *
  * This is the cheap pre-filter -- catching obvious rejects here saves an API
- * call per match.
+ * call per match. excludeKeywords must come from parseExcludeKeywords_, which
+ * is what compiles the per-keyword `pattern`.
  */
 function checkExcludeKeywords_(row, excludeKeywords) {
   if (!excludeKeywords || excludeKeywords.length === 0) return null;
@@ -474,10 +563,8 @@ function checkExcludeKeywords_(row, excludeKeywords) {
 
   for (var i = 0; i < excludeKeywords.length; i++) {
     var kw = excludeKeywords[i];
-    var escaped = kw.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    var pattern = new RegExp('\\b' + escaped + '\\b', 'i');
     var blob = kw.titleOnly ? titleBlob : fullBlob;
-    if (pattern.test(blob)) return kw.text;
+    if (kw.pattern.test(blob)) return kw.text;
   }
   return null;
 }

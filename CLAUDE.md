@@ -57,14 +57,22 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   single row. Returns `{ outcome, madeApiCall }`; the caller uses `outcome` for stats and
   `madeApiCall` to decide whether to sleep (auto-rejects don't sleep).
 - Other helpers (all suffixed `_`, Apps Script's private convention):
-  `resolveColumns_`, `getOrCreateCriteria_`, `parseExcludeKeywords_`, `getUngradedRows_`,
-  `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`, `buildGradingPrompt_`,
-  `parseGradeResponse_`, `updateRowGrade_`, `buildRunLogRow_` / `appendRunLog_`
+  `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
+  `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
+  `getUngradedRows_`, `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`,
+  `buildGradingPrompt_`, `parseGradeResponse_`, `updateRowGrade_`,
+  `buildRunLogRow_` / `appendRunLog_`
   (end-of-run summary to the `Log` sheet, gated on `ENABLE_RUN_LOG`).
+  The sheet-I/O helpers keep their parsing in a pure companion
+  (`getOrCreateCriteria_` → `parseCriteriaValues_`, `getUngradedRows_` →
+  `isGradableStatus_`) so the Node harness can cover it.
 
 ## Conventions
 
 - **Config-driven, not hardcoded.** New knobs go in `GRADER_CONFIG`.
+- **Sheet columns are found by header name, never by position** — the Data sheet via
+  `resolveColumns_`, the Criteria sheet via `parseCriteriaValues_` (which falls back to
+  the first two columns only when the `field`/`value` headers are missing).
 - **Private helpers end in `_`** (Apps Script hides them from the Run menu).
 - **The rubric lives in the sheet, not the code.** That keeps the user's prompt out of
   git. Never inline a real rubric into `DEFAULT_CRITERIA`.
@@ -131,6 +139,13 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   `buildGradingPrompt_` **and** the regex in `parseGradeResponse_`.
 - Changing `updateRowGrade_`? It takes a `cols` object (`{ gradeCol, reasoningCol,
   statusCol }`), not three separate args.
+- Changing which rows a run picks up? Edit `STATUSES_TO_GRADE` (currently `new` +
+  `regrade`) — `isGradableStatus_` is the only place that reads it. Any status added
+  there must be one `updateRowGrade_` overwrites cleanly, since it stamps
+  `STATUS_GRADED` unconditionally.
+- Adding an exclude-keyword field? Build it in `buildExcludeKeyword_`, not in
+  `checkExcludeKeywords_` — the matcher is compiled once per run, and the hot loop
+  assumes every entry already carries its `pattern`.
 
 ## Sync Policy (always — no prompting needed)
 

@@ -35,6 +35,8 @@ var checkExcludeKeywords_ = sandbox.checkExcludeKeywords_;
 var guessRowTitle_ = sandbox.guessRowTitle_;
 var resolveColumns_ = sandbox.resolveColumns_;
 var buildRunLogRow_ = sandbox.buildRunLogRow_;
+var parseCriteriaValues_ = sandbox.parseCriteriaValues_;
+var isGradableStatus_ = sandbox.isGradableStatus_;
 var RUN_LOG_HEADERS = sandbox.RUN_LOG_HEADERS;
 var EXCLUDE_KEYWORDS_PLACEHOLDER = sandbox.EXCLUDE_KEYWORDS_PLACEHOLDER;
 
@@ -51,13 +53,37 @@ function eq(name, actual, expected) {
 }
 
 // --- parseExcludeKeywords_ -------------------------------------------------
+// Entries carry a pre-compiled RegExp, which JSON.stringify flattens to {}, so
+// compare its source string instead -- that also pins the escaping behavior.
+function kws(csv) {
+  return parseExcludeKeywords_(csv).map(function (k) {
+    return { text: k.text, titleOnly: k.titleOnly, pattern: k.pattern.source };
+  });
+}
 eq('empty string -> []', parseExcludeKeywords_(''), []);
 eq('whitespace-only entries dropped', parseExcludeKeywords_(' , ,  '), []);
-eq('lowercases + trims', parseExcludeKeywords_('  FoO , Bar '),
-  [{ text: 'foo', titleOnly: false }, { text: 'bar', titleOnly: false }]);
-eq('title: prefix sets titleOnly', parseExcludeKeywords_('title:remote, intern'),
-  [{ text: 'remote', titleOnly: true }, { text: 'intern', titleOnly: false }]);
+eq('lowercases + trims', kws('  FoO , Bar '),
+  [{ text: 'foo', titleOnly: false, pattern: '\\bfoo\\b' },
+   { text: 'bar', titleOnly: false, pattern: '\\bbar\\b' }]);
+eq('title: prefix sets titleOnly', kws('title:remote, intern'),
+  [{ text: 'remote', titleOnly: true, pattern: '\\bremote\\b' },
+   { text: 'intern', titleOnly: false, pattern: '\\bintern\\b' }]);
 eq('bare "title:" with no text is dropped', parseExcludeKeywords_('title:'), []);
+eq('regex punctuation in a keyword is escaped, not interpreted',
+  kws('node.js'), [{ text: 'node.js', titleOnly: false, pattern: '\\bnode\\.js\\b' }]);
+check('escaped keyword matches literally, not as a wildcard',
+  checkExcludeKeywords_({ body: 'node.js backend', _row: 2 }, parseExcludeKeywords_('node.js')) === 'node.js' &&
+  checkExcludeKeywords_({ body: 'nodexjs backend', _row: 2 }, parseExcludeKeywords_('node.js')) === null);
+// The compiled pattern is reused across rows, so it must not carry match state
+// (a /g flag would advance lastIndex between calls and drop every other hit).
+(function () {
+  var reused = parseExcludeKeywords_('intern');
+  var row = { body: 'summer intern role', _row: 2 };
+  check('compiled pattern is stateless across repeated rows',
+    checkExcludeKeywords_(row, reused) === 'intern' &&
+    checkExcludeKeywords_(row, reused) === 'intern' &&
+    checkExcludeKeywords_(row, reused) === 'intern');
+})();
 
 // --- parseGradeResponse_ ---------------------------------------------------
 eq('null input -> null', parseGradeResponse_(null), null);
@@ -98,9 +124,44 @@ eq('word-boundary: "internal" does not match "intern"',
 eq('title-only keyword matches the title field',
   checkExcludeKeywords_({ title: 'Remote SWE', _row: 2 }, kw), 'remote');
 eq('title-only keyword does NOT match body text',
-  checkExcludeKeywords_({ name: 'X', body: 'fully remote', _row: 2 }, [{ text: 'remote', titleOnly: true }]), null);
+  checkExcludeKeywords_({ name: 'X', body: 'fully remote', _row: 2 }, parseExcludeKeywords_('title:remote')), null);
 eq('keyword in a skipped column (status) is ignored',
   checkExcludeKeywords_({ status: 'intern', _row: 2 }, kw), null);
+
+// --- isGradableStatus_ (which rows a run picks up) -------------------------
+check('"new" is gradable', isGradableStatus_('new') === true);
+check('"regrade" is gradable', isGradableStatus_('regrade') === true);
+check('padded + mixed-case status still matches', isGradableStatus_('  ReGrade ') === true);
+check('"graded" is not re-picked up', isGradableStatus_('graded') === false);
+check('empty status is not gradable', isGradableStatus_('') === false);
+check('blank cell (empty string from the sheet) is not gradable', isGradableStatus_('   ') === false);
+check('null/undefined cell does not throw', isGradableStatus_(null) === false && isGradableStatus_(undefined) === false);
+
+// --- parseCriteriaValues_ (header-named Criteria sheet read) ---------------
+eq('reads key/value by header name',
+  (function () {
+    var c = parseCriteriaValues_([['field', 'value'], ['criteria_text', 'grade it'], ['exclude_keywords', 'a, b']]);
+    return [c.criteria_text, c.exclude_keywords, c._keys];
+  })(),
+  ['grade it', 'a, b', ['criteria_text', 'exclude_keywords']]);
+eq('a column inserted to the LEFT no longer blanks the rubric',
+  parseCriteriaValues_([['notes', 'field', 'value'], ['x', 'criteria_text', 'grade it']]).criteria_text,
+  'grade it');
+eq('a column inserted BETWEEN field and value still resolves',
+  parseCriteriaValues_([['field', 'notes', 'value'], ['criteria_text', 'x', 'grade it']]).criteria_text,
+  'grade it');
+eq('headers are matched case-insensitively and trimmed',
+  parseCriteriaValues_([[' Field ', 'VALUE'], ['criteria_text', 'grade it']]).criteria_text, 'grade it');
+eq('missing headers fall back to the first two columns',
+  parseCriteriaValues_([['k', 'v'], ['criteria_text', 'grade it']]).criteria_text, 'grade it');
+eq('header row only -> empty map with empty _keys',
+  parseCriteriaValues_([['field', 'value']])._keys, []);
+eq('rows with a blank key are skipped',
+  parseCriteriaValues_([['field', 'value'], ['', 'orphan'], ['criteria_text', 'grade it']])._keys,
+  ['criteria_text']);
+eq('_keys reports what was found, for the empty-criteria error message',
+  parseCriteriaValues_([['field', 'value'], ['critera_text', 'typo'], ['exclude_keywords', '']])._keys,
+  ['critera_text', 'exclude_keywords']);
 
 // --- guessRowTitle_ --------------------------------------------------------
 eq('prefers title', guessRowTitle_({ title: 'T', name: 'N', _row: 2 }), 'T');

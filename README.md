@@ -53,7 +53,7 @@ that decides what's worth your own attention, not as the final word.
 ## How it works
 
 ```
-Data sheet (status="new" rows)
+Data sheet (status="new" or "regrade" rows)
          │
          ▼
   exclude-keyword regex  ──►  match? → grade F, no API call
@@ -77,8 +77,8 @@ A few details worth knowing:
   graded. If the script dies on row 47, rows 1–46 are already saved and
   the next run picks up from 47.
 - **Respects the Apps Script 6-minute limit.** Defaults to bailing at 5
-  minutes; remaining rows stay `status="new"` and get processed on the
-  next scheduled run.
+  minutes; remaining rows keep their existing status and get processed on
+  the next scheduled run.
 - **Sleeps between API calls** (default 7s — tuned for Groq's free tier
   6K tokens/minute). Drop this if you're on a paid tier.
 - **One retry on HTTP 429** with a 5-second backoff.
@@ -186,6 +186,18 @@ The comma is the only separator and there's no escape for it, so a single
 keyword can't contain a literal comma. Multi-word phrases without commas
 (`fast casual`) are fine.
 
+### Re-grading after a rubric change
+
+Rubrics take a couple of passes to get right, and grades produced by the old
+one are worth re-checking. To re-run a row, set its `status` cell back to
+`regrade` and run `gradeNewRows` again — the row is picked up exactly like a
+`new` one, and its `grade` and `reasoning` are overwritten with the new result.
+
+To re-grade everything, select the whole `status` column below the header and
+paste `regrade` down it. The usual limits still apply: a run stops at 5 minutes
+and the rest carry over to the next one, so a large re-grade takes a few runs
+(or a few trigger firings) to work through.
+
 ## Schema
 
 ### Data sheet (you create this)
@@ -194,7 +206,7 @@ Three required columns, anywhere in the header row:
 
 | column | what goes in it |
 | --- | --- |
-| `status` | `new` for rows to grade. Becomes `graded` after. |
+| `status` | `new` for rows to grade. Becomes `graded` after. Set it back to `regrade` to run a row again — see [Re-grading after a rubric change](#re-grading-after-a-rubric-change). |
 | `grade` | Filled in by the script (`A+` through `F`). |
 | `reasoning` | Filled in by the script (~2 sentences). |
 
@@ -209,6 +221,11 @@ Two rows:
 | --- | --- |
 | `criteria_text` | Your rubric. |
 | `exclude_keywords` | Comma-separated dealbreaker words. |
+
+The two columns are found by their header names (`field` and `value`), not by
+position, so you can insert your own columns around them. Don't rename those two
+headers, though — if either name is missing, the script falls back to reading
+the first two columns.
 
 ### Log sheet (auto-created on first run)
 
@@ -245,6 +262,8 @@ Most things you'd want to change are in `GRADER_CONFIG` at the top of
   limit. Default 300s.
 - `VALID_GRADES` — change the grading scale (e.g. to a 1-5 numeric scale
   — also update the prompt format string in `buildGradingPrompt_`).
+- `STATUSES_TO_GRADE` — which `status` values a run picks up. Default
+  `['new', 'regrade']`; add your own if you want another entry point.
 - `SKIP_COLUMNS_IN_PROMPT` — columns that won't be sent to the LLM
   (already metadata, not content).
 - `MAX_FIELD_CHARS` — per-field truncation. Default 600. Bump up if
@@ -255,8 +274,8 @@ Most things you'd want to change are in `GRADER_CONFIG` at the top of
 
 On purpose, to keep the example clean:
 
-- **No retry queue.** Errors get logged and the row stays `status="new"`
-  for the next run to pick up. That's the whole retry strategy.
+- **No retry queue.** Errors get logged and the row keeps its current
+  status, so the next run picks it up again. That's the whole retry strategy.
 - **No fancy follow-up actions.** The source project also generates
   cover letters for A-grade matches and emails them. That's intentionally
   not here — once you have grades in your sheet, write your own
