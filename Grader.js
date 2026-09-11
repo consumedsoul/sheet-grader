@@ -3,15 +3,15 @@
  *
  * Generic LLM-based grader for Google Sheets rows.
  *
- * Reads rows with status "new" from a Data sheet, grades each against a
- * criteria rubric you write in a Criteria sheet, and writes grade + reasoning
- * back to the row. Two-stage pipeline: a cheap keyword filter rejects obvious
- * non-matches before any API call is made, then the rest go to the LLM.
+ * Reads rows with status "new" or "regrade" from a Data sheet, grades each
+ * against a criteria rubric you write in a Criteria sheet, and writes grade +
+ * reasoning back to the row. Two-stage pipeline: a cheap keyword filter rejects
+ * obvious non-matches before any API call is made, then the rest go to the LLM.
  *
  * Pipeline:
  *   1. Read criteria + exclude keywords from the Criteria sheet
  *      (auto-creates the sheet with placeholder text on first run)
- *   2. Get all rows from the Data sheet where status = "new"
+ *   2. Get all rows from the Data sheet where status is "new" or "regrade"
  *   3. Stage 1 (cheap): rows matching an exclude keyword are auto-graded F
  *      with no API call
  *   4. Stage 2 (LLM): for each surviving row, build a prompt from its fields,
@@ -51,8 +51,8 @@ var GRADER_CONFIG = {
   // Drop to 1000-2000ms for paid tiers.
   API_DELAY_MS: 7000,
 
-  // Bail before the 6-minute Apps Script execution limit. Remaining rows
-  // stay status="new" and get picked up on the next run.
+  // Bail before the 6-minute Apps Script execution limit. Remaining rows keep
+  // their existing status ("new" or "regrade") and get picked up on the next run.
   TIMER_BUDGET_SEC: 300,
 
   // Sheet names
@@ -137,7 +137,8 @@ var DEFAULT_CRITERIA = {
 // ============================================================================
 
 /**
- * Grades all ungraded rows (status = "new"). Run manually or on a trigger.
+ * Grades every row whose status is in GRADER_CONFIG.STATUSES_TO_GRADE ("new" or
+ * "regrade" by default). Run manually or on a trigger.
  */
 function gradeNewRows() {
   var startTime = new Date();
@@ -486,11 +487,18 @@ function buildExcludeKeyword_(text, titleOnly) {
 
 /**
  * True when a row's raw status cell means "grade this row" -- i.e. it matches
- * one of GRADER_CONFIG.STATUSES_TO_GRADE once trimmed and lowercased.
+ * one of GRADER_CONFIG.STATUSES_TO_GRADE. Both sides are trimmed and
+ * lowercased, so a config entry like 'Recheck' still matches a "recheck" cell
+ * instead of silently never picking anything up.
  */
 function isGradableStatus_(rawStatus) {
   var s = rawStatus === null || rawStatus === undefined ? '' : rawStatus.toString().trim().toLowerCase();
-  return GRADER_CONFIG.STATUSES_TO_GRADE.indexOf(s) !== -1;
+  if (s === '') return false;
+  var statuses = GRADER_CONFIG.STATUSES_TO_GRADE;
+  for (var i = 0; i < statuses.length; i++) {
+    if (statuses[i].toString().trim().toLowerCase() === s) return true;
+  }
+  return false;
 }
 
 /**
@@ -761,8 +769,8 @@ function updateRowGrade_(sheet, row, cols, grade, reasoning) {
 // RUN LOG
 // ============================================================================
 
-// Column order for the Log sheet. 'deferred' mirrors stats.skipped (rows left
-// status="new" when a run hits the timer budget and resumes next time).
+// Column order for the Log sheet. 'deferred' mirrors stats.skipped (rows that
+// keep their existing status when a run hits the timer budget and resume next time).
 var RUN_LOG_HEADERS = ['run_at', 'total', 'graded', 'rejected', 'errors', 'deferred', 'elapsed_sec'];
 
 /**

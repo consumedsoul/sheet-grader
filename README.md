@@ -263,7 +263,8 @@ Most things you'd want to change are in `GRADER_CONFIG` at the top of
 - `VALID_GRADES` — change the grading scale (e.g. to a 1-5 numeric scale
   — also update the prompt format string in `buildGradingPrompt_`).
 - `STATUSES_TO_GRADE` — which `status` values a run picks up. Default
-  `['new', 'regrade']`; add your own if you want another entry point.
+  `['new', 'regrade']`; add your own if you want another entry point. Matched
+  case-insensitively, so `'Recheck'` and a `recheck` cell line up.
 - `SKIP_COLUMNS_IN_PROMPT` — columns that won't be sent to the LLM
   (already metadata, not content).
 - `MAX_FIELD_CHARS` — per-field truncation. Default 600. Bump up if

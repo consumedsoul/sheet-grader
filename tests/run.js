@@ -136,6 +136,14 @@ check('"graded" is not re-picked up', isGradableStatus_('graded') === false);
 check('empty status is not gradable', isGradableStatus_('') === false);
 check('blank cell (empty string from the sheet) is not gradable', isGradableStatus_('   ') === false);
 check('null/undefined cell does not throw', isGradableStatus_(null) === false && isGradableStatus_(undefined) === false);
+// Config entries are normalized too, so a capitalized custom status isn't a silent no-op.
+(function () {
+  var original = sandbox.GRADER_CONFIG.STATUSES_TO_GRADE;
+  sandbox.GRADER_CONFIG.STATUSES_TO_GRADE = ['new', ' Recheck '];
+  check('capitalized/padded config entry still matches its cell',
+    isGradableStatus_('recheck') === true && isGradableStatus_('RECHECK') === true);
+  sandbox.GRADER_CONFIG.STATUSES_TO_GRADE = original;
+})();
 
 // --- parseCriteriaValues_ (header-named Criteria sheet read) ---------------
 eq('reads key/value by header name',

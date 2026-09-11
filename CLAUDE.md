@@ -32,10 +32,10 @@ last. An ask buried in the middle is an ask he will miss.
 ## What this is
 
 A single-file Google Apps Script (`Grader.js`) that grades rows of a Google Sheet with
-an LLM. Reads `status="new"` rows from a **Data** sheet, grades each against a rubric the
-user writes in a **Criteria** sheet, writes `grade` + `reasoning` back, flips status to
-`graded`. Provider-agnostic via the OpenAI-compatible `chat/completions` format (default:
-Groq GPT OSS 20B).
+an LLM. Reads `status="new"` (or `"regrade"`) rows from a **Data** sheet, grades each
+against a rubric the user writes in a **Criteria** sheet, writes `grade` + `reasoning`
+back, flips status to `graded`. Provider-agnostic via the OpenAI-compatible
+`chat/completions` format (default: Groq GPT OSS 20B).
 
 This is a template/example repo meant to be copied into other people's sheets, so keep it
 generic and keep the README honest. It is not wired up to a live spreadsheet here, so the
@@ -85,7 +85,7 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
 ## Gotchas (Apps Script specific)
 
 - **6-minute execution cap.** `TIMER_BUDGET_SEC` (default 300) bails early; leftover rows
-  stay `new` and resume next run. Don't write loops that can't be resumed.
+  keep their existing status and resume next run. Don't write loops that can't be resumed.
 - **Secrets live in Script Properties, never in code.** Required property:
   `LLM_API_KEY`. Set via Project Settings → Script Properties.
 - **OAuth scopes are declared explicitly** in `appsscript.json`
@@ -105,7 +105,7 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   function throws, so config failures (missing key, empty `criteria_text`, unresolvable
   columns) `throw` and the top-level catch logs *then* rethrows. Never convert one back
   to a clean `return` — that makes a broken unattended run look successful. Genuinely
-  empty states still return normally: no Data sheet rows, nothing with `status="new"`,
+  empty states still return normally: no Data sheet rows, nothing with a gradable status,
   and the first run that seeds the Criteria sheet (flagged `_justCreated` by
   `getOrCreateCriteria_`, since README step 8 tells the user to expect it).
 
