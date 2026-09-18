@@ -37,6 +37,9 @@ var resolveColumns_ = sandbox.resolveColumns_;
 var buildRunLogRow_ = sandbox.buildRunLogRow_;
 var parseCriteriaValues_ = sandbox.parseCriteriaValues_;
 var isGradableStatus_ = sandbox.isGradableStatus_;
+var findRowTitle_ = sandbox.findRowTitle_;
+var normalizeConfig_ = sandbox.normalizeConfig_;
+var buildGradingPrompt_ = sandbox.buildGradingPrompt_;
 var RUN_LOG_HEADERS = sandbox.RUN_LOG_HEADERS;
 var EXCLUDE_KEYWORDS_PLACEHOLDER = sandbox.EXCLUDE_KEYWORDS_PLACEHOLDER;
 
@@ -107,6 +110,23 @@ eq('bold label with colon inside the emphasis',
 eq('bold label with colon outside the emphasis',
   parseGradeResponse_('**GRADE**: B-\n**REASONING**: Partial match. Some gaps.'),
   { grade: 'B-', reasoning: 'Partial match. Some gaps.' });
+eq('grade token is not the prefix of a longer word',
+  parseGradeResponse_('GRADE: Apple\nREASONING: x'), null);
+// The grade pattern is built from VALID_GRADES, so a new scale needs no other edit.
+(function () {
+  var original = sandbox.GRADER_CONFIG.VALID_GRADES;
+  sandbox.GRADER_CONFIG.VALID_GRADES = ['10', '5', '4', '3', '2', '1'];
+  eq('numeric scale parses once VALID_GRADES is changed',
+    parseGradeResponse_('GRADE: 4\nREASONING: ok'), { grade: '4', reasoning: 'ok' });
+  eq('numeric scale: "10" is not read as "1"',
+    parseGradeResponse_('**GRADE:** 10\nREASONING: ok').grade, '10');
+  eq('numeric scale: out-of-scale number -> null',
+    parseGradeResponse_('GRADE: 7\nREASONING: ok'), null);
+  sandbox.GRADER_CONFIG.VALID_GRADES = ['Pass', 'Fail'];
+  eq('word scale matched case-insensitively, returned as configured',
+    parseGradeResponse_('GRADE: PASS\nREASONING: ok').grade, 'Pass');
+  sandbox.GRADER_CONFIG.VALID_GRADES = original;
+})();
 (function () {
   var long = 'GRADE: F\nREASONING: ' + new Array(1000).join('x');
   var out = parseGradeResponse_(long);
@@ -127,6 +147,14 @@ eq('title-only keyword does NOT match body text',
   checkExcludeKeywords_({ name: 'X', body: 'fully remote', _row: 2 }, parseExcludeKeywords_('title:remote')), null);
 eq('keyword in a skipped column (status) is ignored',
   checkExcludeKeywords_({ status: 'intern', _row: 2 }, kw), null);
+// With no title/name column, a title-only keyword must not fall through to
+// whatever column happens to come first (that produced false-positive Fs).
+eq('title-only keyword does NOT match a body column when there is no title column',
+  checkExcludeKeywords_({ description: 'permanently closed last year', _row: 2 }, parseExcludeKeywords_('title:closed')), null);
+eq('title-only keyword sees the whole title, not an 80-char slice',
+  checkExcludeKeywords_({ title: new Array(101).join('x') + ' closed', _row: 2 }, parseExcludeKeywords_('title:closed')), 'closed');
+eq('findRowTitle_ -> null when no title column', findRowTitle_({ body: 'B', _row: 2 }), null);
+eq('findRowTitle_ skips an empty title and uses name', findRowTitle_({ title: '', name: 'N', _row: 2 }), 'N');
 
 // --- isGradableStatus_ (which rows a run picks up) -------------------------
 check('"new" is gradable', isGradableStatus_('new') === true);
@@ -143,6 +171,25 @@ check('null/undefined cell does not throw', isGradableStatus_(null) === false &&
   check('capitalized/padded config entry still matches its cell',
     isGradableStatus_('recheck') === true && isGradableStatus_('RECHECK') === true);
   sandbox.GRADER_CONFIG.STATUSES_TO_GRADE = original;
+})();
+
+// --- normalizeConfig_ (config entries vs lowercased sheet headers) --------
+(function () {
+  var cfg = { SKIP_COLUMNS_IN_PROMPT: ['status', ' Notes '], TITLE_COLUMNS: ['Title'],
+    STATUSES_TO_GRADE: ['New', ''], STATUS_COLUMN: 'Status', GRADE_COLUMN: 'grade',
+    REASONING_COLUMN: 'reasoning', CRITERIA_KEY_HEADER: 'Field', CRITERIA_VALUE_HEADER: 'value' };
+  normalizeConfig_(cfg);
+  eq('normalizeConfig_ lowercases + trims lists and drops blanks',
+    [cfg.SKIP_COLUMNS_IN_PROMPT, cfg.TITLE_COLUMNS, cfg.STATUSES_TO_GRADE],
+    [['status', 'notes'], ['title'], ['new']]);
+  eq('normalizeConfig_ lowercases column/header names', [cfg.STATUS_COLUMN, cfg.CRITERIA_KEY_HEADER], ['status', 'field']);
+
+  var original = sandbox.GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT;
+  sandbox.GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT = ['Notes'];
+  normalizeConfig_(sandbox.GRADER_CONFIG);
+  check('a capitalized SKIP_COLUMNS_IN_PROMPT entry keeps that column out of the prompt',
+    buildGradingPrompt_('rubric', { notes: 'SECRET', body: 'B', _row: 2 }).indexOf('SECRET') === -1);
+  sandbox.GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT = original;
 })();
 
 // --- parseCriteriaValues_ (header-named Criteria sheet read) ---------------

@@ -59,7 +59,8 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
   `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
-  `getUngradedRows_`, `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`,
+  `normalizeConfig_` (runs once at load), `getUngradedRows_`, `findRowTitle_` /
+  `hasTitleColumn_` / `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`,
   `buildGradingPrompt_`, `parseGradeResponse_`, `updateRowGrade_`,
   `buildRunLogRow_` / `appendRunLog_`
   (end-of-run summary to the `Log` sheet, gated on `ENABLE_RUN_LOG`).
@@ -84,8 +85,9 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
 
 ## Gotchas (Apps Script specific)
 
-- **6-minute execution cap.** `TIMER_BUDGET_SEC` (default 300) bails early; leftover rows
-  keep their existing status and resume next run. Don't write loops that can't be resumed.
+- **6-minute execution cap.** `TIMER_BUDGET_SEC` (default 270) bails early. The check
+  counts the pending pacing sleep, and the gap to 360s is the last row's fetch
+  allowance. Leftover rows keep their existing status and resume next run. Don't write loops that can't be resumed.
 - **Secrets live in Script Properties, never in code.** Required property:
   `LLM_API_KEY`. Set via Project Settings → Script Properties.
 - **OAuth scopes are declared explicitly** in `appsscript.json`
@@ -135,8 +137,13 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   that reject the parameter. One exception: `MAX_OUTPUT_TOKENS` goes out as
   `max_tokens`, and newer reasoning-model endpoints accept only
   `max_completion_tokens` — rename it in `callLlmApi_` if a swap 400s on that.
-- Changing the grade scale? Update `VALID_GRADES` **and** the format string in
-  `buildGradingPrompt_` **and** the regex in `parseGradeResponse_`.
+- Changing the grade scale? Only `VALID_GRADES` — the prompt format string and the
+  `parseGradeResponse_` pattern are both built from it, and its last entry is the
+  Stage-1 reject grade. Don't reintroduce a hardcoded grade regex or a literal `'F'`.
+- Adding a config value that's compared to a sheet header/cell? Add it to
+  `normalizeConfig_` so a capitalized entry can't silently fail to match.
+- `title:` keywords match only `findRowTitle_` (the `TITLE_COLUMNS`). Keep
+  `guessRowTitle_`'s fallback-to-any-column behavior out of matching — it's for logs.
 - Changing `updateRowGrade_`? It takes a `cols` object (`{ gradeCol, reasoningCol,
   statusCol }`), not three separate args.
 - Changing which rows a run picks up? Edit `STATUSES_TO_GRADE` (currently `new` +

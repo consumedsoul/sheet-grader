@@ -124,7 +124,12 @@ You need a Google account and a free [Groq API key](https://console.groq.com)
 9. Run `gradeNewRows` again. Your rows should fill in.
 10. To make it automatic: in the editor, **Triggers (alarm clock icon) →
     Add Trigger.** Function: `gradeNewRows`. Event source: time-driven.
-    Pick whatever cadence you want (e.g. daily, every hour).
+    Pick whatever cadence you want (e.g. daily, every hour). On a free
+    (consumer) Google account, triggers get about 90 minutes of total run
+    time per day. An idle run takes about a second, but a run working through
+    a backlog uses its full ~4.5 minutes, so an hourly trigger can hit the cap
+    mid-backlog and stop firing until the next day. During a big re-grade,
+    every 2 hours is safer.
 
 ### Option B: clasp (recommended if you'll edit the code)
 
@@ -172,11 +177,14 @@ shows up on a "best of LA" listicle unless it's also genuinely good.
 ```
 
 **`exclude_keywords` is your dealbreaker shortcut.** Comma-separated.
-Anything matching gets `F` instantly with no API call. Matching is
-whole-word and case-insensitive, so `intern` won't match `internal`. Use
-`title:` as a prefix to only match a row's title field (useful when a body
-description might mention the keyword in a benign way, like "we are not an
-unpaid internship"). Example:
+Anything matching gets `F` (the last entry in `VALID_GRADES`) instantly with
+no API call. Matching is whole-word and case-insensitive, so `intern` won't
+match `internal`. Use `title:` as a prefix to only match a row's title
+(useful when a body description might mention the keyword in a benign way,
+like "we are not an unpaid internship"). The title is the row's `title`
+column, or `name` if `title` is empty — set `TITLE_COLUMNS` to use others.
+**If your Data sheet has neither column, `title:` keywords never match**
+(the run log warns about this). Example:
 
 ```
 chain, fast casual, title:closed, title:permanently
@@ -194,7 +202,7 @@ one are worth re-checking. To re-run a row, set its `status` cell back to
 `new` one, and its `grade` and `reasoning` are overwritten with the new result.
 
 To re-grade everything, select the whole `status` column below the header and
-paste `regrade` down it. The usual limits still apply: a run stops at 5 minutes
+paste `regrade` down it. The usual limits still apply: a run stops at 4.5 minutes
 and the rest carry over to the next one, so a large re-grade takes a few runs
 (or a few trigger firings) to work through.
 
@@ -242,34 +250,47 @@ sheet — is expected, and exits quietly.)
 
 ## Configuration
 
-Most things you'd want to change are in `GRADER_CONFIG` at the top of
-[Grader.js](Grader.js):
+All settings live in `GRADER_CONFIG` at the top of [Grader.js](Grader.js).
+Change behavior there, not in the functions. Anything that names a column,
+header, or status is matched case-insensitively.
 
-- `API_ENDPOINT` / `API_MODEL` — switch providers or models here. Default is
-  Groq's `openai/gpt-oss-20b`.
-- `REASONING_EFFORT` — `low`/`medium`/`high` for reasoning models like
-  `openai/gpt-oss-*`. Default `low`; those models spend hidden reasoning
-  tokens out of `MAX_OUTPUT_TOKENS` before answering. Set to `''` for
-  providers that don't accept the parameter — it's only sent when non-empty.
-- `MAX_OUTPUT_TOKENS` — ceiling on reasoning **and** visible output together.
-  Too low and the reply gets clipped, which reads as a parse error. Sent on the
-  wire as `max_tokens` (Groq treats it as an alias for `max_completion_tokens`).
-  Some newer reasoning-model endpoints — OpenAI's `o*`/`gpt-5*` among them —
-  reject `max_tokens` and accept only `max_completion_tokens`; if a provider
-  swap fails on that, rename the field in `callLlmApi_`.
-- `API_DELAY_MS` — sleep between calls. Lower on paid tiers.
-- `TIMER_BUDGET_SEC` — when to bail before the 6-minute Apps Script
-  limit. Default 300s.
-- `VALID_GRADES` — change the grading scale (e.g. to a 1-5 numeric scale
-  — also update the prompt format string in `buildGradingPrompt_`).
-- `STATUSES_TO_GRADE` — which `status` values a run picks up. Default
-  `['new', 'regrade']`; add your own if you want another entry point. Matched
-  case-insensitively, so `'Recheck'` and a `recheck` cell line up.
-- `SKIP_COLUMNS_IN_PROMPT` — columns that won't be sent to the LLM
-  (already metadata, not content).
-- `MAX_FIELD_CHARS` — per-field truncation. Default 600. Bump up if
-  your rows have important long-form content.
-- `ENABLE_RUN_LOG` — append a per-run summary to the `Log` sheet. Default on.
+**Provider and model**
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `API_ENDPOINT` | Groq chat completions URL | Any OpenAI-compatible `chat/completions` endpoint. |
+| `API_MODEL` | `openai/gpt-oss-20b` | Model name sent to that endpoint. |
+| `API_KEY_PROPERTY` | `LLM_API_KEY` | Name of the Script Property holding your API key. |
+| `REASONING_EFFORT` | `low` | `low`/`medium`/`high` for reasoning models like `openai/gpt-oss-*`, which spend hidden reasoning tokens out of `MAX_OUTPUT_TOKENS`. Set to `''` for providers that reject the parameter — it's only sent when non-empty. |
+| `TEMPERATURE` | `0.3` | Lower = more consistent grades. |
+| `MAX_OUTPUT_TOKENS` | `1200` | Ceiling on reasoning **and** visible output together. Too low and the reply gets clipped, which reads as a parse error. Sent as `max_tokens`; some newer reasoning-model endpoints (OpenAI's `o*`/`gpt-5*` among them) accept only `max_completion_tokens` — if a provider swap fails on that, rename the field in `callLlmApi_`. |
+
+**Pacing**
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `API_DELAY_MS` | `7000` | Pause after each API call, sized for Groq's free tier. Lower on paid tiers. |
+| `TIMER_BUDGET_SEC` | `270` | A run stops starting new rows after this, leaving room under Apps Script's 6-minute cap for the last row's API call. Leftover rows carry over to the next run. |
+
+**Sheets and columns**
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `DATA_SHEET` / `CRITERIA_SHEET` / `LOG_SHEET` | `Data` / `Criteria` / `Log` | Tab names. |
+| `STATUS_COLUMN` / `GRADE_COLUMN` / `REASONING_COLUMN` | `status` / `grade` / `reasoning` | Required Data sheet column headers. |
+| `TITLE_COLUMNS` | `['title', 'name']` | Which column counts as a row's title for `title:` exclude keywords (first non-empty wins). |
+| `CRITERIA_KEY_HEADER` / `CRITERIA_VALUE_HEADER` | `field` / `value` | Criteria sheet column headers. |
+| `SKIP_COLUMNS_IN_PROMPT` | `status`, `grade`, `reasoning`, `id`, `scraped_at`, `graded_at` | Columns never sent to the LLM or checked by exclude keywords. Add anything you don't want leaving the sheet. |
+| `MAX_FIELD_CHARS` | `600` | Per-field truncation in the prompt. Raise it if your rows have important long-form content. |
+| `ENABLE_RUN_LOG` | `true` | Append a per-run summary to the `Log` sheet. |
+
+**Statuses and grades**
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `STATUSES_TO_GRADE` | `['new', 'regrade']` | Which `status` values a run picks up. Add your own for another entry point. |
+| `STATUS_GRADED` | `graded` | Written to `status` after a row is graded. |
+| `VALID_GRADES` | `A+` … `F` | The grading scale, best first. The prompt and the parser are both built from this list, so changing it here is the whole change (e.g. `['5', '4', '3', '2', '1']`). The **last** entry is what exclude-keyword rejects get. Update your rubric in the Criteria sheet to match. |
 
 ## What it doesn't do
 
@@ -298,7 +319,7 @@ On purpose, to keep the example clean:
 ## Development
 
 The pure helpers (keyword parsing, response parsing, whole-word exclude
-matching, row-title guessing) have a dependency-free Node test harness:
+matching, row titles, config normalization) have a dependency-free Node test harness:
 
 ```
 npm test        # or: node tests/run.js

@@ -53,7 +53,9 @@ var GRADER_CONFIG = {
 
   // Bail before the 6-minute Apps Script execution limit. Remaining rows keep
   // their existing status ("new" or "regrade") and get picked up on the next run.
-  TIMER_BUDGET_SEC: 300,
+  // Checked before each row (including the pacing sleep ahead of it), so the
+  // gap to 360s is the allowance for that last row's API call and a 429 retry.
+  TIMER_BUDGET_SEC: 270,
 
   // Sheet names
   DATA_SHEET: 'Data',
@@ -76,6 +78,11 @@ var GRADER_CONFIG = {
   GRADE_COLUMN: 'grade',
   REASONING_COLUMN: 'reasoning',
 
+  // Columns treated as the row's title, first non-empty wins. "title:"
+  // exclude keywords match only these; a row with none of them never matches
+  // a title-only keyword (rather than guessing some other column).
+  TITLE_COLUMNS: ['title', 'name'],
+
   // Status values. A row is picked up by a run when its status is one of
   // STATUSES_TO_GRADE, and stamped STATUS_GRADED once written back. "regrade"
   // exists so you can re-run rows against a revised rubric by typing one word
@@ -84,7 +91,7 @@ var GRADER_CONFIG = {
   STATUS_GRADED: 'graded',
 
   // Columns to skip when building the prompt (already metadata, not content
-  // worth grading). Lowercased, matched case-insensitively.
+  // worth grading). Matched case-insensitively (see normalizeConfig_).
   SKIP_COLUMNS_IN_PROMPT: ['status', 'grade', 'reasoning', 'id', 'scraped_at', 'graded_at'],
 
   // Per-field truncation in the prompt to keep token usage predictable.
@@ -101,9 +108,36 @@ var GRADER_CONFIG = {
   TEMPERATURE: 0.3,
   MAX_OUTPUT_TOKENS: 1200,
 
-  // Valid grades returned by the LLM. Anything else is treated as a parse failure.
+  // Valid grades returned by the LLM, best first. Anything else is treated as
+  // a parse failure. This list is the only place the scale lives: the prompt
+  // and the parser are both built from it, and the LAST entry is the grade
+  // written for a Stage-1 exclude-keyword reject. Matched case-insensitively.
   VALID_GRADES: ['A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D', 'F']
 };
+
+normalizeConfig_(GRADER_CONFIG);
+
+/**
+ * Trims + lowercases every config value that is compared against a sheet
+ * header or cell, once at load. Sheet-side values are always lowercased, so an
+ * entry like 'Notes' in SKIP_COLUMNS_IN_PROMPT would otherwise silently never
+ * match -- and that column's data would go to the LLM anyway.
+ */
+function normalizeConfig_(cfg) {
+  function norm(v) { return v === null || v === undefined ? '' : v.toString().trim().toLowerCase(); }
+  var scalars = ['STATUS_COLUMN', 'GRADE_COLUMN', 'REASONING_COLUMN',
+    'CRITERIA_KEY_HEADER', 'CRITERIA_VALUE_HEADER'];
+  for (var i = 0; i < scalars.length; i++) cfg[scalars[i]] = norm(cfg[scalars[i]]);
+  var lists = ['SKIP_COLUMNS_IN_PROMPT', 'TITLE_COLUMNS', 'STATUSES_TO_GRADE'];
+  for (var j = 0; j < lists.length; j++) {
+    var out = [];
+    var src = cfg[lists[j]] || [];
+    for (var k = 0; k < src.length; k++) {
+      if (norm(src[k])) out.push(norm(src[k]));
+    }
+    cfg[lists[j]] = out;
+  }
+}
 
 // Seeded into the Criteria sheet's exclude_keywords on first run. Kept as a
 // single hyphenated token (no commas) so it can never match real row content,
@@ -173,6 +207,10 @@ function gradeNewRows() {
       rawExcludeKeywords = '';
     }
     var excludeKeywords = parseExcludeKeywords_(rawExcludeKeywords);
+    var hasTitleOnlyKeyword = false;
+    for (var t = 0; t < excludeKeywords.length; t++) {
+      if (excludeKeywords[t].titleOnly) hasTitleOnlyKeyword = true;
+    }
     if (!criteriaText) {
       // A run that just seeded the Criteria sheet is the documented setup step
       // (README step 8), not a failure -- don't page the owner over it.
@@ -206,6 +244,12 @@ function gradeNewRows() {
     for (var h = 0; h < headers.length; h++) {
       var key = headers[h].toString().toLowerCase().trim();
       if (!key) continue;
+      // _row is where each row object keeps its sheet row number, so a column
+      // with that header would be overwritten and never read.
+      if (key === '_row') {
+        Logger.log('WARNING: column ' + (h + 1) + ' is headed "_row", which is reserved -- rename it or its contents are ignored.');
+        continue;
+      }
       // Duplicate header names collapse to the last column, which can silently
       // route reads/writes to the wrong place. Track them so resolveColumns_ can
       // hard-fail on a duplicated *required* column and warn on the rest.
@@ -220,6 +264,11 @@ function gradeNewRows() {
     // resolveColumns_ already logged the specific missing/duplicate-column error.
     if (!cols) throw new Error('Data sheet columns could not be resolved -- see the log line above.');
 
+    if (hasTitleOnlyKeyword && !hasTitleColumn_(colMap)) {
+      Logger.log('WARNING: "title:" exclude keywords are set, but the Data sheet has no ' +
+        GRADER_CONFIG.TITLE_COLUMNS.join('/') + ' column, so they will never match.');
+    }
+
     var rows = getUngradedRows_(sheet, headers, colMap);
     if (rows.length === 0) {
       Logger.log('No ungraded rows. Exiting.');
@@ -228,24 +277,25 @@ function gradeNewRows() {
     Logger.log('Found ' + rows.length + ' ungraded rows');
 
     var stats = { total: rows.length, graded: 0, rejected: 0, errors: 0, skipped: 0 };
+    // Only pace against the API rate limit after an actual API call. Stage-1
+    // auto-rejects make no call, so the row after one starts with no delay.
+    var pauseMs = 0;
 
     for (var i = 0; i < rows.length; i++) {
+      // The pending pause counts against the budget, so the check covers
+      // everything this row will spend except its own API call.
       var elapsed = (new Date() - startTime) / 1000;
-      if (elapsed > GRADER_CONFIG.TIMER_BUDGET_SEC) {
+      if (elapsed + pauseMs / 1000 > GRADER_CONFIG.TIMER_BUDGET_SEC) {
         stats.skipped = rows.length - i;
         Logger.log('Hit timer budget at ' + elapsed.toFixed(0) + 's. Stopping at row ' +
           (i + 1) + ' of ' + rows.length + ' (' + stats.skipped + ' deferred to next run)');
         break;
       }
+      if (pauseMs) Utilities.sleep(pauseMs);
 
       var result = gradeOneRow_(sheet, rows[i], cols, criteriaText, excludeKeywords, apiKey);
       stats[result.outcome]++;
-
-      // Only pace against the API rate limit when we actually called the API.
-      // Stage-1 auto-rejects make no call, so they advance with no delay.
-      if (result.madeApiCall && i < rows.length - 1) {
-        Utilities.sleep(GRADER_CONFIG.API_DELAY_MS);
-      }
+      pauseMs = result.madeApiCall ? GRADER_CONFIG.API_DELAY_MS : 0;
     }
 
     var totalElapsedSec = (new Date() - startTime) / 1000;
@@ -321,8 +371,9 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
   var excludeMatch = checkExcludeKeywords_(row, excludeKeywords);
   if (excludeMatch) {
     var reason = 'Auto-rejected: matched exclude keyword "' + excludeMatch + '"';
-    updateRowGrade_(sheet, row._row, cols, 'F', reason);
-    Logger.log('  [F] ' + titleHint + ' -- ' + reason);
+    var lowest = GRADER_CONFIG.VALID_GRADES[GRADER_CONFIG.VALID_GRADES.length - 1];
+    updateRowGrade_(sheet, row._row, cols, lowest, reason);
+    Logger.log('  [' + lowest + '] ' + titleHint + ' -- ' + reason);
     return { outcome: 'rejected', madeApiCall: false };
   }
 
@@ -443,7 +494,7 @@ function parseCriteriaValues_(values) {
 /**
  * Parses a comma-separated keyword string into [{ text, titleOnly, pattern }, ...].
  * A "title:" prefix means the keyword only matches against the title field
- * (see guessRowTitle_), useful for avoiding false positives in body text.
+ * (see findRowTitle_), useful for avoiding false positives in body text.
  *
  * The whole-word matcher is compiled once here rather than per row, since
  * checkExcludeKeywords_ runs this list against every row in the batch.
@@ -527,15 +578,38 @@ function getUngradedRows_(sheet, headers, colMap) {
 }
 
 /**
- * Best-effort title for logging: prefers "title", then "name", then the first
- * non-skipped column value.
+ * The row's title: the first non-empty GRADER_CONFIG.TITLE_COLUMNS value, or
+ * null when there is none. Used for "title:" keyword matching, so it never
+ * guesses -- see guessRowTitle_ for the logging variant that does.
+ */
+function findRowTitle_(row) {
+  var titleCols = GRADER_CONFIG.TITLE_COLUMNS;
+  for (var i = 0; i < titleCols.length; i++) {
+    var v = row[titleCols[i]];
+    if (v !== null && v !== undefined && v.toString().trim() !== '') return v.toString();
+  }
+  return null;
+}
+
+/** True when the Data sheet header (colMap) has any of TITLE_COLUMNS. */
+function hasTitleColumn_(colMap) {
+  var titleCols = GRADER_CONFIG.TITLE_COLUMNS;
+  for (var i = 0; i < titleCols.length; i++) {
+    if (colMap[titleCols[i]]) return true;
+  }
+  return false;
+}
+
+/**
+ * Best-effort title for logging only: the real title (findRowTitle_), else the
+ * first non-skipped column value, else the row number.
  */
 function guessRowTitle_(row) {
-  if (row.title) return row.title.toString();
-  if (row.name) return row.name.toString();
+  var title = findRowTitle_(row);
+  if (title !== null) return title;
   for (var key in row) {
     if (key === '_row') continue;
-    if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key.toLowerCase()) !== -1) continue;
+    if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key) !== -1) continue;
     if (row[key]) return row[key].toString().substring(0, 80);
   }
   return 'row ' + row._row;
@@ -550,7 +624,8 @@ function guessRowTitle_(row) {
  * Returns the matched keyword text if any exclude keyword appears as a whole
  * word in the row's text fields, or null otherwise. Word-boundary regex avoids
  * false positives ("intern" doesn't match "internal"). Keywords flagged
- * titleOnly only check the row's title field.
+ * titleOnly only check the row's title (a TITLE_COLUMNS column); a row with no
+ * title never matches them.
  *
  * This is the cheap pre-filter -- catching obvious rejects here saves an API
  * call per match. excludeKeywords must come from parseExcludeKeywords_, which
@@ -559,12 +634,13 @@ function guessRowTitle_(row) {
 function checkExcludeKeywords_(row, excludeKeywords) {
   if (!excludeKeywords || excludeKeywords.length === 0) return null;
 
-  var titleBlob = guessRowTitle_(row).toLowerCase();
+  var title = findRowTitle_(row);
+  var titleBlob = title === null ? null : title.toLowerCase();
 
   var fullParts = [];
   for (var key in row) {
     if (key === '_row') continue;
-    if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key.toLowerCase()) !== -1) continue;
+    if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key) !== -1) continue;
     if (row[key]) fullParts.push(row[key].toString());
   }
   var fullBlob = fullParts.join(' ').toLowerCase();
@@ -572,7 +648,7 @@ function checkExcludeKeywords_(row, excludeKeywords) {
   for (var i = 0; i < excludeKeywords.length; i++) {
     var kw = excludeKeywords[i];
     var blob = kw.titleOnly ? titleBlob : fullBlob;
-    if (kw.pattern.test(blob)) return kw.text;
+    if (blob !== null && kw.pattern.test(blob)) return kw.text;
   }
   return null;
 }
@@ -679,7 +755,7 @@ function buildGradingPrompt_(criteriaText, row) {
 
   for (var key in row) {
     if (key === '_row') continue;
-    if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key.toLowerCase()) !== -1) continue;
+    if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key) !== -1) continue;
     var val = row[key];
     if (val === '' || val === null || val === undefined) continue;
     var strVal = val.toString();
@@ -711,15 +787,30 @@ function buildGradingPrompt_(criteriaText, row) {
  * "**GRADE**: A") because instruction-tuned models often bold a label they were
  * told to emit verbatim, and a stricter "GRADE:" match would throw away an
  * otherwise perfectly good answer. Only the label is flexible -- the grade token
- * itself is still validated against VALID_GRADES.
+ * itself must be one of VALID_GRADES.
+ *
+ * The grade alternatives are built from VALID_GRADES (longest first, so "A+"
+ * wins over "A"), so changing the scale there is enough -- a hardcoded letter
+ * pattern here used to make a numeric scale fail every row. Matching is
+ * case-insensitive; the returned grade is spelled as in VALID_GRADES.
  */
 function parseGradeResponse_(responseText) {
   if (!responseText) return null;
 
-  var gradeMatch = responseText.match(/GRADE\**\s*:\s*\**\s*([A-Fa-f][+-]?)/);
+  var grades = GRADER_CONFIG.VALID_GRADES.slice().sort(function (a, b) { return b.length - a.length; });
+  var alts = [];
+  for (var i = 0; i < grades.length; i++) {
+    alts.push(grades[i].toString().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  }
+  // The trailing lookahead stops "A" from matching the start of "Apple" or "1" of "10".
+  var gradePattern = new RegExp('GRADE\\**\\s*:\\s*\\**\\s*(' + alts.join('|') + ')(?![A-Za-z0-9+-])', 'i');
+  var gradeMatch = responseText.match(gradePattern);
   if (!gradeMatch) return null;
-  var grade = gradeMatch[1].toUpperCase();
-  if (GRADER_CONFIG.VALID_GRADES.indexOf(grade) === -1) return null;
+  var grade = null;
+  for (var g = 0; g < grades.length; g++) {
+    if (grades[g].toString().toLowerCase() === gradeMatch[1].toLowerCase()) grade = grades[g];
+  }
+  if (grade === null) return null;
 
   var reasoningMatch = responseText.match(/REASONING\**\s*:\s*\**\s*([\s\S]+)/);
   var reasoning = reasoningMatch ? reasoningMatch[1].trim() : 'No reasoning provided.';
