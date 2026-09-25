@@ -76,7 +76,7 @@ A few details worth knowing:
 - **Crash-safe.** Each row is written back to the sheet as soon as it's
   graded. If the script dies on row 47, rows 1–46 are already saved and
   the next run picks up from 47.
-- **Respects the Apps Script 6-minute limit.** Defaults to bailing at 5
+- **Respects the Apps Script 6-minute limit.** Defaults to bailing at 4.5
   minutes; remaining rows keep their existing status and get processed on
   the next scheduled run.
 - **Sleeps between API calls** (default 7s — tuned for Groq's free tier
@@ -231,9 +231,10 @@ Two rows:
 | `exclude_keywords` | Comma-separated dealbreaker words. |
 
 The two columns are found by their header names (`field` and `value`), not by
-position, so you can insert your own columns around them. Don't rename those two
-headers, though — if either name is missing, the script falls back to reading
-the first two columns.
+position, so you can insert your own columns around them. If you rename them,
+change `CRITERIA_KEY_HEADER` / `CRITERIA_VALUE_HEADER` in `GRADER_CONFIG` to match
+(the script seeds the sheet from those two values). If either name is missing,
+the script falls back to reading the first two columns.
 
 ### Log sheet (auto-created on first run)
 

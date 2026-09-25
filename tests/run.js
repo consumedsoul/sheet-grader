@@ -112,6 +112,9 @@ eq('bold label with colon outside the emphasis',
   { grade: 'B-', reasoning: 'Partial match. Some gaps.' });
 eq('grade token is not the prefix of a longer word',
   parseGradeResponse_('GRADE: Apple\nREASONING: x'), null);
+eq('lowercase labels keep the reasoning (not the default text)',
+  parseGradeResponse_('Grade: B\nReasoning: solid fit overall.'),
+  { grade: 'B', reasoning: 'solid fit overall.' });
 // The grade pattern is built from VALID_GRADES, so a new scale needs no other edit.
 (function () {
   var original = sandbox.GRADER_CONFIG.VALID_GRADES;

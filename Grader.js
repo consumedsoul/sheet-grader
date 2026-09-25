@@ -420,7 +420,7 @@ function getOrCreateCriteria_() {
   if (!sheet) {
     Logger.log('Creating Criteria sheet with placeholder text...');
     sheet = ss.insertSheet(GRADER_CONFIG.CRITERIA_SHEET);
-    sheet.getRange(1, 1, 1, 2).setValues([['field', 'value']]);
+    sheet.getRange(1, 1, 1, 2).setValues([[GRADER_CONFIG.CRITERIA_KEY_HEADER, GRADER_CONFIG.CRITERIA_VALUE_HEADER]]);
     sheet.getRange(1, 1, 1, 2).setFontWeight('bold');
     sheet.getRange(2, 1, 2, 2).setValues([
       ['criteria_text', DEFAULT_CRITERIA.criteria_text],
@@ -812,7 +812,7 @@ function parseGradeResponse_(responseText) {
   }
   if (grade === null) return null;
 
-  var reasoningMatch = responseText.match(/REASONING\**\s*:\s*\**\s*([\s\S]+)/);
+  var reasoningMatch = responseText.match(/REASONING\**\s*:\s*\**\s*([\s\S]+)/i);
   var reasoning = reasoningMatch ? reasoningMatch[1].trim() : 'No reasoning provided.';
   if (reasoning.length > 800) reasoning = reasoning.substring(0, 797) + '...';
 
