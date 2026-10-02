@@ -191,7 +191,10 @@ function gradeNewRows() {
     var apiKey = PropertiesService.getScriptProperties().getProperty(GRADER_CONFIG.API_KEY_PROPERTY);
     // Config failures throw rather than return. Apps Script only sends its
     // "your trigger failed" email when the trigger function throws, so a clean
-    // return here would let a revoked key repeat as a silent no-op forever.
+    // return here would let a missing key repeat as a silent no-op forever.
+    // This only checks that a key exists. A key the provider rejects (or a
+    // retired model) surfaces later: callLlmApi_ throws a `fatal` error on
+    // 401/403/404, and the all-calls-failed guard after the loop covers the rest.
     if (!apiKey) {
       throw new Error('No API key. Set ' + GRADER_CONFIG.API_KEY_PROPERTY + ' in Project Settings > Script Properties.');
     }
@@ -244,10 +247,11 @@ function gradeNewRows() {
     for (var h = 0; h < headers.length; h++) {
       var key = headers[h].toString().toLowerCase().trim();
       if (!key) continue;
-      // _row is where each row object keeps its sheet row number, so a column
-      // with that header would be overwritten and never read.
-      if (key === '_row') {
-        Logger.log('WARNING: column ' + (h + 1) + ' is headed "_row", which is reserved -- rename it or its contents are ignored.');
+      // Row objects keep internal bookkeeping under "_"-prefixed keys (_row is
+      // the sheet row number, _snapshot the values read at the start of the
+      // run), so a column with such a header would be overwritten and never read.
+      if (key.charAt(0) === '_') {
+        Logger.log('WARNING: column ' + (h + 1) + ' is headed "' + key + '" -- headers starting with "_" are reserved; rename it or its contents are ignored.');
         continue;
       }
       // Duplicate header names collapse to the last column, which can silently
@@ -277,6 +281,11 @@ function gradeNewRows() {
     Logger.log('Found ' + rows.length + ' ungraded rows');
 
     var stats = { total: rows.length, graded: 0, rejected: 0, errors: 0, skipped: 0 };
+    // Set when a row fails in a way no later row can recover from (rejected
+    // key, unknown model). The loop stops, the Log row is still written so the
+    // failure is visible in the sheet, and then the run throws so Apps Script
+    // emails the trigger owner.
+    var fatalMessage = null;
     // Only pace against the API rate limit after an actual API call. Stage-1
     // auto-rejects make no call, so the row after one starts with no delay.
     var pauseMs = 0;
@@ -286,9 +295,10 @@ function gradeNewRows() {
       // everything this row will spend except its own API call.
       var elapsed = (new Date() - startTime) / 1000;
       if (elapsed + pauseMs / 1000 > GRADER_CONFIG.TIMER_BUDGET_SEC) {
-        stats.skipped = rows.length - i;
+        var remaining = rows.length - i;
+        stats.skipped += remaining;
         Logger.log('Hit timer budget at ' + elapsed.toFixed(0) + 's. Stopping at row ' +
-          (i + 1) + ' of ' + rows.length + ' (' + stats.skipped + ' deferred to next run)');
+          (i + 1) + ' of ' + rows.length + ' (' + remaining + ' deferred to next run)');
         break;
       }
       if (pauseMs) Utilities.sleep(pauseMs);
@@ -296,6 +306,14 @@ function gradeNewRows() {
       var result = gradeOneRow_(sheet, rows[i], cols, criteriaText, excludeKeywords, apiKey);
       stats[result.outcome]++;
       pauseMs = result.madeApiCall ? GRADER_CONFIG.API_DELAY_MS : 0;
+      if (result.fatal) {
+        // Every remaining row would fail the same way; stop burning calls.
+        var left = rows.length - i - 1;
+        stats.skipped += left;
+        fatalMessage = result.fatal;
+        Logger.log('Stopping run: ' + fatalMessage + ' (' + left + ' deferred to next run)');
+        break;
+      }
     }
 
     var totalElapsedSec = (new Date() - startTime) / 1000;
@@ -311,6 +329,17 @@ function gradeNewRows() {
         Logger.log('WARNING: failed to write run log: ' + logErr.message);
       }
     }
+
+    // A run in which every API-bound row failed is a broken run, not a quiet
+    // one -- a revoked key, a retired model or a wrong endpoint (providers that
+    // answer those with 400 or 5xx don't trip the fatal path above). The rows
+    // are still ungraded and the Log row records the failure, but only a throw
+    // gets the trigger owner emailed.
+    if (!fatalMessage && stats.graded === 0 && stats.errors > 0) {
+      fatalMessage = 'All ' + stats.errors + ' API-graded row(s) failed and none succeeded -- check ' +
+        GRADER_CONFIG.API_KEY_PROPERTY + ', API_MODEL and API_ENDPOINT; see the log above.';
+    }
+    if (fatalMessage) throw new Error(fatalMessage);
 
   } catch (e) {
     Logger.log('FATAL ERROR: ' + e.message);
@@ -372,6 +401,10 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
   if (excludeMatch) {
     var reason = 'Auto-rejected: matched exclude keyword "' + excludeMatch + '"';
     var lowest = GRADER_CONFIG.VALID_GRADES[GRADER_CONFIG.VALID_GRADES.length - 1];
+    if (!rowStillInPlace_(sheet, row)) {
+      Logger.log('  [SKIP] Row ' + row._row + ' (' + titleHint + ') moved or changed since the run started -- not writing; it will be graded next run.');
+      return { outcome: 'skipped', madeApiCall: false };
+    }
     updateRowGrade_(sheet, row._row, cols, lowest, reason);
     Logger.log('  [' + lowest + '] ' + titleHint + ' -- ' + reason);
     return { outcome: 'rejected', madeApiCall: false };
@@ -382,7 +415,7 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
     var prompt = buildGradingPrompt_(criteriaText, row);
     var responseText = callLlmApi_(apiKey, prompt);
     if (!responseText) {
-      Logger.log('  [ERR] Empty API response for: ' + titleHint);
+      Logger.log('  [ERR] No usable API response for: ' + titleHint + ' (see the API error above)');
       return { outcome: 'errors', madeApiCall: true };
     }
 
@@ -393,13 +426,19 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
       return { outcome: 'errors', madeApiCall: true };
     }
 
+    if (!rowStillInPlace_(sheet, row)) {
+      Logger.log('  [SKIP] Row ' + row._row + ' (' + titleHint + ') moved or changed since the run started -- not writing; it will be graded next run.');
+      return { outcome: 'skipped', madeApiCall: true };
+    }
     updateRowGrade_(sheet, row._row, cols, parsed.grade, parsed.reasoning);
     Logger.log('  [' + parsed.grade + '] ' + titleHint);
     return { outcome: 'graded', madeApiCall: true };
 
   } catch (apiErr) {
     Logger.log('  [ERR] Exception on ' + titleHint + ': ' + apiErr.message);
-    return { outcome: 'errors', madeApiCall: true };
+    // `fatal` marks a failure every later row would repeat (see callLlmApi_);
+    // the caller stops the run on it instead of counting it per row.
+    return { outcome: 'errors', madeApiCall: true, fatal: apiErr.fatal ? apiErr.message : null };
   }
 }
 
@@ -519,15 +558,17 @@ function parseExcludeKeywords_(csvString) {
 
 /**
  * One parsed exclude keyword, with its whole-word matcher pre-compiled. The
- * word boundaries are what keep "intern" from matching "internal"; the escape
- * keeps a keyword containing regex punctuation (e.g. "node.js") literal.
+ * lookarounds are what keep "intern" from matching "internal". They stand in
+ * for \b because \b needs a word character on its own side of the edge, so a
+ * keyword that starts or ends with punctuation ("c++", ".net", "c#") could
+ * never match with it. The escape keeps regex punctuation in a keyword literal.
  */
 function buildExcludeKeyword_(text, titleOnly) {
   var escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return {
     text: text,
     titleOnly: titleOnly,
-    pattern: new RegExp('\\b' + escaped + '\\b', 'i')
+    pattern: new RegExp('(?<![A-Za-z0-9_])' + escaped + '(?![A-Za-z0-9_])', 'i')
   };
 }
 
@@ -554,7 +595,9 @@ function isGradableStatus_(rawStatus) {
 
 /**
  * Returns row objects whose status is gradable (see isGradableStatus_), each
- * tagged with a _row property pointing to its 1-based sheet row number.
+ * tagged with _row (its 1-based sheet row number) and _snapshot (the raw cell
+ * values read here, which rowStillInPlace_ re-checks before any write). Every
+ * iterator over a row skips "_"-prefixed keys.
  */
 function getUngradedRows_(sheet, headers, colMap) {
   var lastRow = sheet.getLastRow();
@@ -571,10 +614,35 @@ function getUngradedRows_(sheet, headers, colMap) {
         row[headers[j].toString().trim().toLowerCase()] = data[i][j];
       }
       row._row = i + 2;
+      row._snapshot = data[i];
       rows.push(row);
     }
   }
   return rows;
+}
+
+/**
+ * Re-reads a row right before its grade is written and reports whether it
+ * still holds the values captured at the start of the run. A backlog run lasts
+ * up to TIMER_BUDGET_SEC, and sorting the Data tab (or inserting rows above)
+ * in that window renumbers every row -- without this check the grade would
+ * land on whichever row now sits at that number. Costs one read per write.
+ */
+function rowStillInPlace_(sheet, row) {
+  var current = sheet.getRange(row._row, 1, 1, row._snapshot.length).getValues()[0];
+  return rowMatchesSnapshot_(row._snapshot, current);
+}
+
+/**
+ * Pure cell-by-cell comparison behind rowStillInPlace_. Values are compared as
+ * strings so dates and numbers read back from the sheet compare by content.
+ */
+function rowMatchesSnapshot_(snapshot, current) {
+  if (!snapshot || !current || snapshot.length !== current.length) return false;
+  for (var i = 0; i < snapshot.length; i++) {
+    if (String(snapshot[i]) !== String(current[i])) return false;
+  }
+  return true;
 }
 
 /**
@@ -608,7 +676,7 @@ function guessRowTitle_(row) {
   var title = findRowTitle_(row);
   if (title !== null) return title;
   for (var key in row) {
-    if (key === '_row') continue;
+    if (key.charAt(0) === '_') continue;
     if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key) !== -1) continue;
     if (row[key]) return row[key].toString().substring(0, 80);
   }
@@ -639,7 +707,7 @@ function checkExcludeKeywords_(row, excludeKeywords) {
 
   var fullParts = [];
   for (var key in row) {
-    if (key === '_row') continue;
+    if (key.charAt(0) === '_') continue;
     if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key) !== -1) continue;
     if (row[key]) fullParts.push(row[key].toString());
   }
@@ -660,7 +728,11 @@ function checkExcludeKeywords_(row, excludeKeywords) {
 
 /**
  * Posts a single prompt to the configured OpenAI-compatible endpoint.
- * Returns response text, or null on error. Retries once on HTTP 429.
+ * Returns response text, or null on a per-call error (bad JSON, 5xx, a 429
+ * that survives the one retry). Throws an Error tagged `fatal` on HTTP
+ * 401/403/404 -- a rejected key, or an unknown model/endpoint -- because every
+ * later call in the run would fail the same way; gradeOneRow_ passes that up
+ * and gradeNewRows stops the run and rethrows so the trigger owner is emailed.
  */
 function callLlmApi_(apiKey, prompt) {
   var payload = {
@@ -717,6 +789,14 @@ function callLlmApi_(apiKey, prompt) {
       continue;
     }
 
+    if (code === 401 || code === 403 || code === 404) {
+      var hint = code === 404 ? 'check API_ENDPOINT and API_MODEL'
+        : 'check the ' + GRADER_CONFIG.API_KEY_PROPERTY + ' Script Property';
+      var fatal = new Error('API error ' + code + ' (' + hint + '): ' + response.getContentText().substring(0, 200));
+      fatal.fatal = true;
+      throw fatal;
+    }
+
     Logger.log('  API error ' + code + ': ' + response.getContentText().substring(0, 200));
     return null;
   }
@@ -754,7 +834,7 @@ function buildGradingPrompt_(criteriaText, row) {
   lines.push('----- BEGIN ITEM DATA -----');
 
   for (var key in row) {
-    if (key === '_row') continue;
+    if (key.charAt(0) === '_') continue;
     if (GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT.indexOf(key) !== -1) continue;
     var val = row[key];
     if (val === '' || val === null || val === undefined) continue;
@@ -802,8 +882,12 @@ function parseGradeResponse_(responseText) {
   for (var i = 0; i < grades.length; i++) {
     alts.push(grades[i].toString().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   }
-  // The trailing lookahead stops "A" from matching the start of "Apple" or "1" of "10".
-  var gradePattern = new RegExp('GRADE\\**\\s*:\\s*\\**\\s*(' + alts.join('|') + ')(?![A-Za-z0-9+-])', 'i');
+  // The label must start a line (markdown emphasis/heading marks before it are
+  // fine): unanchored, "Upgrade: A" read as grade A. The trailing lookahead
+  // stops "A" from matching the start of "Apple" or "1" of "10". The optional
+  // brackets tolerate a model echoing the format line's "[...]".
+  var gradePattern = new RegExp('^[ \\t*_#]*GRADE\\**\\s*:\\s*\\**\\s*\\[?\\s*(' +
+    alts.join('|') + ')(?![A-Za-z0-9+-])\\]?', 'im');
   var gradeMatch = responseText.match(gradePattern);
   if (!gradeMatch) return null;
   var grade = null;
@@ -812,7 +896,11 @@ function parseGradeResponse_(responseText) {
   }
   if (grade === null) return null;
 
-  var reasoningMatch = responseText.match(/REASONING\**\s*:\s*\**\s*([\s\S]+)/i);
+  // Reasoning is looked for only after the GRADE line, and only at a line start
+  // (or right after the grade on the same line), so a preamble such as "Here is
+  // my reasoning: ..." can't be captured along with the GRADE line itself.
+  var afterGrade = responseText.substring(gradeMatch.index + gradeMatch[0].length);
+  var reasoningMatch = afterGrade.match(/(?:^|\n)[ \t*_#]*REASONING\**\s*:\s*\**\s*([\s\S]+)/i);
   var reasoning = reasoningMatch ? reasoningMatch[1].trim() : 'No reasoning provided.';
   if (reasoning.length > 800) reasoning = reasoning.substring(0, 797) + '...';
 

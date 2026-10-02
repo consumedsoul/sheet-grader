@@ -87,6 +87,11 @@ A few details worth knowing:
   rather than grading the same rows twice.
 - **Truncates long fields** in the prompt so token use stays predictable
   even if someone pastes a 50KB description into a cell.
+- **Don't sort or insert rows in the Data tab while a run is in progress.**
+  Each row is re-read right before its grade is written. If it has moved or
+  changed since the run started, the write is skipped with a warning, the row
+  counts as `deferred`, and it's graded on the next run — rather than landing
+  on whatever row now sits at that number.
 
 ## Setup
 
@@ -179,7 +184,8 @@ shows up on a "best of LA" listicle unless it's also genuinely good.
 **`exclude_keywords` is your dealbreaker shortcut.** Comma-separated.
 Anything matching gets `F` (the last entry in `VALID_GRADES`) instantly with
 no API call. Matching is whole-word and case-insensitive, so `intern` won't
-match `internal`. Use `title:` as a prefix to only match a row's title
+match `internal`; keywords that start or end with punctuation (`c++`, `.net`,
+`c#`) work too. Use `title:` as a prefix to only match a row's title
 (useful when a body description might mention the keyword in a benign way,
 like "we are not an unpaid internship"). The title is the row's `title`
 column, or `name` if `title` is empty — set `TITLE_COLUMNS` to use others.
@@ -248,6 +254,13 @@ writes **no** Log row. It throws instead, so Apps Script marks the execution
 failed and emails the trigger owner. A gap in the Log sheet means a broken run,
 not a quiet one. (Setup step 8 — the first run that *creates* the Criteria
 sheet — is expected, and exits quietly.)
+
+A run whose API calls all fail — a revoked or rotated key, a retired model, a
+wrong endpoint — is also treated as broken, not quiet: it writes its Log row
+(so the `errors` column shows it) *and then* throws, so you still get the
+email. A `401`, `403` or `404` stops the run at the first row instead of
+retrying every row; a provider that answers with `400` or a server error is
+caught at the end of the run, when no API-graded row succeeded.
 
 ## Configuration
 
@@ -327,8 +340,11 @@ npm test        # or: node tests/run.js
 ```
 
 It loads the real `Grader.js` into a sandbox with the Apps Script globals
-stubbed, so the assertions run against the actual source. The sheet I/O and
-API calls have no local runtime — those only run bound to a real spreadsheet.
+stubbed, so the assertions run against the actual source. It also runs
+`gradeNewRows` end to end against in-memory stand-ins for the Sheets and fetch
+services, covering the happy path, a rejected key, a retired model and a row
+that moves mid-run. Real Sheets and network behavior still only run bound to a
+real spreadsheet.
 
 ## License
 

@@ -39,9 +39,11 @@ back, flips status to `graded`. Provider-agnostic via the OpenAI-compatible
 
 This is a template/example repo meant to be copied into other people's sheets, so keep it
 generic and keep the README honest. It is not wired up to a live spreadsheet here, so the
-Apps Script integration (sheet I/O, API calls) only runs bound to a real sheet — but the
-pure helpers do have a Node test harness (`npm test` / `tests/run.js`) that exercises the
-real `Grader.js` source; run it after touching any parsing/filtering logic.
+real Apps Script services only run bound to a real sheet — but the Node test harness
+(`npm test` / `tests/run.js`) exercises the real `Grader.js` source: the pure helpers
+directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/fetch
+(happy path, rejected key, retired model, row moved mid-run). Run it after touching
+anything; add a scenario there when touching the loop or a failure path.
 
 ## Architecture (one file, top-down in `Grader.js`)
 
@@ -54,12 +56,17 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   (`resolveColumns_`), then loops rows calling `gradeOneRow_` and pacing against the rate
   limit. Respects a timer budget so it can resume across runs.
 - `gradeOneRow_` — Stage 1 (regex reject, no API call) → Stage 2 (LLM) → write back for a
-  single row. Returns `{ outcome, madeApiCall }`; the caller uses `outcome` for stats and
-  `madeApiCall` to decide whether to sleep (auto-rejects don't sleep).
+  single row. Returns `{ outcome, madeApiCall, fatal }`; the caller uses `outcome` for
+  stats, `madeApiCall` to decide whether to sleep (auto-rejects don't sleep), and `fatal`
+  (an error message, set when `callLlmApi_` threw a `fatal`-tagged error) to stop the run.
+  Before either write it calls `rowStillInPlace_`, which re-reads the row and compares it
+  to the `_snapshot` taken by `getUngradedRows_`; a mismatch skips the write (outcome
+  `skipped`) so a sort mid-run can't put a grade on the wrong row.
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
   `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
-  `normalizeConfig_` (runs once at load), `getUngradedRows_`, `findRowTitle_` /
+  `normalizeConfig_` (runs once at load), `getUngradedRows_`, `rowStillInPlace_` /
+  `rowMatchesSnapshot_`, `findRowTitle_` /
   `hasTitleColumn_` / `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`,
   `buildGradingPrompt_`, `parseGradeResponse_`, `updateRowGrade_`,
   `buildRunLogRow_` / `appendRunLog_`
@@ -75,6 +82,9 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   `resolveColumns_`, the Criteria sheet via `parseCriteriaValues_` (which falls back to
   the first two columns only when the `field`/`value` headers are missing).
 - **Private helpers end in `_`** (Apps Script hides them from the Run menu).
+- **Row-object keys starting with `_` are internal** (`_row`, `_snapshot`). Every
+  iterator over a row skips them, and a Data-sheet header starting with `_` is ignored
+  with a warning.
 - **The rubric lives in the sheet, not the code.** That keeps the user's prompt out of
   git. Never inline a real rubric into `DEFAULT_CRITERIA`.
 - **Writes are per-row and immediate** (`updateRowGrade_`) on purpose — a mid-run crash
@@ -110,6 +120,11 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   empty states still return normally: no Data sheet rows, nothing with a gradable status,
   and the first run that seeds the Criteria sheet (flagged `_justCreated` by
   `getOrCreateCriteria_`, since README step 8 tells the user to expect it).
+  A *present but rejected* key or a retired model must throw too: `callLlmApi_` throws a
+  `fatal`-tagged error on 401/403/404 (the loop stops at that row), and after the loop a
+  run with `graded === 0 && errors > 0` throws as well. Both happen *after* the Log row
+  is written, so the sheet shows the failure and the owner still gets the email. The
+  per-row `try/catch` in `gradeOneRow_` must keep passing `fatal` up, not swallow it.
 
 ## Required Script Properties
 
@@ -124,14 +139,20 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
   don't trust grades from a hostile data source. Results only ever land in the sheet.
 - `exclude_keywords` splits on `,` with no escape, so a single keyword can't contain a
   literal comma. Documented in the README.
-- The pure helpers have a Node test harness (`npm test` / `node tests/run.js`); it stubs
-  the Apps Script globals and exercises the real `Grader.js` source. The Apps Script
-  *integration* (sheet I/O, API calls) has no runtime here — it only runs bound to a sheet.
+- The Node test harness (`npm test` / `node tests/run.js`) stubs the Apps Script globals
+  and exercises the real `Grader.js` source, including `gradeNewRows` end to end against
+  in-memory Sheets/fetch stand-ins. Real Sheets and network behavior still only run bound
+  to a sheet.
+- A row that moves or changes mid-run is skipped and deferred, not graded. Legit mid-run
+  edits to a row's cells therefore push that row to the next run (one extra API call).
 
 ## Safe-change checklist
 
-- Touching the loop? Preserve resumability (timer budget) and per-row writes, and keep the
-  rate-limit sleep gated on `madeApiCall` so auto-rejects stay free.
+- Touching the loop? Preserve resumability (timer budget) and per-row writes, keep the
+  rate-limit sleep gated on `madeApiCall` so auto-rejects stay free, keep the `fatal` break
+  and the all-failed throw after the Log write, and keep `stats.skipped` additive (`+=`) —
+  moved rows and the timer budget both feed it. Add a scenario to the end-to-end section of
+  `tests/run.js`.
 - Adding a provider? Usually only `API_ENDPOINT` / `API_MODEL` / key need to change —
   plus `REASONING_EFFORT`, which is only sent when non-empty; blank it for providers
   that reject the parameter. One exception: `MAX_OUTPUT_TOKENS` goes out as
@@ -140,6 +161,11 @@ real `Grader.js` source; run it after touching any parsing/filtering logic.
 - Changing the grade scale? Only `VALID_GRADES` — the prompt format string and the
   `parseGradeResponse_` pattern are both built from it, and its last entry is the
   Stage-1 reject grade. Don't reintroduce a hardcoded grade regex or a literal `'F'`.
+- Changing `parseGradeResponse_`? Both labels are anchored to a line start (markdown
+  marks allowed before them) and REASONING is only searched *after* the GRADE match.
+  Unanchored, "Upgrade: A" parsed as a grade and a preamble became the reasoning.
+- Changing `buildExcludeKeyword_`? The edges are lookarounds, not `\b` — `\b` can't
+  match a keyword that starts or ends with punctuation (`c++`, `.net`, `c#`).
 - Adding a config value that's compared to a sheet header/cell? Add it to
   `normalizeConfig_` so a capitalized entry can't silently fail to match.
 - `title:` keywords match only `findRowTitle_` (the `TITLE_COLUMNS`). Keep

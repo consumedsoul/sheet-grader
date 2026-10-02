@@ -7,9 +7,11 @@
  * sandbox and exercises them. Testing the source directly (not a copy) means
  * these assertions can't drift from the code they cover.
  *
- * Only the genuinely pure helpers are tested here — anything that calls
- * SpreadsheetApp / UrlFetchApp / PropertiesService is integration-only and can
- * only run bound to a real sheet.
+ * The pure helpers are tested directly. The last section also runs
+ * gradeNewRows() end to end against in-memory stand-ins for SpreadsheetApp /
+ * UrlFetchApp / PropertiesService / LockService, which is what covers the
+ * failure paths (rejected key, retired model, a row that moved mid-run). Real
+ * Sheets and network behavior still only run bound to a real spreadsheet.
  */
 'use strict';
 
@@ -19,11 +21,12 @@ var vm = require('vm');
 
 // --- Load Grader.js with Apps Script globals stubbed -----------------------
 var source = fs.readFileSync(path.join(__dirname, '..', 'Grader.js'), 'utf8');
+var logLines = [];
 var sandbox = {
-  Logger: { log: function () {} },
+  Logger: { log: function (m) { logLines.push(String(m)); } },
   Utilities: { sleep: function () {} }
-  // SpreadsheetApp / UrlFetchApp / PropertiesService / LockService are only
-  // referenced by functions we don't unit-test, so they stay undefined.
+  // SpreadsheetApp / UrlFetchApp / PropertiesService / LockService are
+  // installed per scenario by the end-to-end section below.
 };
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox, { filename: 'Grader.js' });
@@ -40,6 +43,8 @@ var isGradableStatus_ = sandbox.isGradableStatus_;
 var findRowTitle_ = sandbox.findRowTitle_;
 var normalizeConfig_ = sandbox.normalizeConfig_;
 var buildGradingPrompt_ = sandbox.buildGradingPrompt_;
+var rowMatchesSnapshot_ = sandbox.rowMatchesSnapshot_;
+var gradeNewRows = sandbox.gradeNewRows;
 var RUN_LOG_HEADERS = sandbox.RUN_LOG_HEADERS;
 var EXCLUDE_KEYWORDS_PLACEHOLDER = sandbox.EXCLUDE_KEYWORDS_PLACEHOLDER;
 
@@ -63,17 +68,28 @@ function kws(csv) {
     return { text: k.text, titleOnly: k.titleOnly, pattern: k.pattern.source };
   });
 }
+// Whole-word edges are lookarounds, not \b, so punctuation-edged keywords work.
+function ww(escaped) { return '(?<![A-Za-z0-9_])' + escaped + '(?![A-Za-z0-9_])'; }
 eq('empty string -> []', parseExcludeKeywords_(''), []);
 eq('whitespace-only entries dropped', parseExcludeKeywords_(' , ,  '), []);
 eq('lowercases + trims', kws('  FoO , Bar '),
-  [{ text: 'foo', titleOnly: false, pattern: '\\bfoo\\b' },
-   { text: 'bar', titleOnly: false, pattern: '\\bbar\\b' }]);
+  [{ text: 'foo', titleOnly: false, pattern: ww('foo') },
+   { text: 'bar', titleOnly: false, pattern: ww('bar') }]);
 eq('title: prefix sets titleOnly', kws('title:remote, intern'),
-  [{ text: 'remote', titleOnly: true, pattern: '\\bremote\\b' },
-   { text: 'intern', titleOnly: false, pattern: '\\bintern\\b' }]);
+  [{ text: 'remote', titleOnly: true, pattern: ww('remote') },
+   { text: 'intern', titleOnly: false, pattern: ww('intern') }]);
 eq('bare "title:" with no text is dropped', parseExcludeKeywords_('title:'), []);
 eq('regex punctuation in a keyword is escaped, not interpreted',
-  kws('node.js'), [{ text: 'node.js', titleOnly: false, pattern: '\\bnode\\.js\\b' }]);
+  kws('node.js'), [{ text: 'node.js', titleOnly: false, pattern: ww('node\\.js') }]);
+// \b needs a word character on its side of the edge, so these could never match.
+eq('keyword ending in punctuation (c++) matches as a whole word',
+  checkExcludeKeywords_({ body: 'senior c++ developer', _row: 2 }, parseExcludeKeywords_('c++')), 'c++');
+eq('keyword starting with punctuation (.net) matches as a whole word',
+  checkExcludeKeywords_({ body: 'hiring .net engineer', _row: 2 }, parseExcludeKeywords_('.net')), '.net');
+eq('keyword ending in # (c#) matches as a whole word',
+  checkExcludeKeywords_({ body: 'c# and azure', _row: 2 }, parseExcludeKeywords_('c#')), 'c#');
+eq('punctuation-edged keyword still respects the word edge (c++ vs c++x)',
+  checkExcludeKeywords_({ body: 'c++x toolkit', _row: 2 }, parseExcludeKeywords_('c++')), null);
 check('escaped keyword matches literally, not as a wildcard',
   checkExcludeKeywords_({ body: 'node.js backend', _row: 2 }, parseExcludeKeywords_('node.js')) === 'node.js' &&
   checkExcludeKeywords_({ body: 'nodexjs backend', _row: 2 }, parseExcludeKeywords_('node.js')) === null);
@@ -115,6 +131,19 @@ eq('grade token is not the prefix of a longer word',
 eq('lowercase labels keep the reasoning (not the default text)',
   parseGradeResponse_('Grade: B\nReasoning: solid fit overall.'),
   { grade: 'B', reasoning: 'solid fit overall.' });
+// Labels are anchored to a line start, and reasoning is only read after GRADE.
+eq('a preamble mentioning "reasoning:" is not captured as the reasoning',
+  parseGradeResponse_('Here is my reasoning: it fits.\nGRADE: B\nREASONING: Good.'),
+  { grade: 'B', reasoning: 'Good.' });
+eq('"Upgrade: A" is not read as a grade', parseGradeResponse_('Upgrade: A\nREASONING: x'), null);
+eq('GRADE mid-line is not read as a grade',
+  parseGradeResponse_('I would not grade: A here.\nREASONING: x'), null);
+eq('bracketed grade echo (GRADE: [B]) is accepted',
+  parseGradeResponse_('GRADE: [B]\nREASONING: ok'), { grade: 'B', reasoning: 'ok' });
+eq('both labels on one line still parse',
+  parseGradeResponse_('GRADE: B REASONING: ok'), { grade: 'B', reasoning: 'ok' });
+eq('leading blank line and bold labels still parse',
+  parseGradeResponse_('\n**GRADE**: A\n**REASONING**: Great.'), { grade: 'A', reasoning: 'Great.' });
 // The grade pattern is built from VALID_GRADES, so a new scale needs no other edit.
 (function () {
   var original = sandbox.GRADER_CONFIG.VALID_GRADES;
@@ -247,6 +276,170 @@ eq('run-log row matches header order + rounds elapsed',
 eq('run-log row width equals header width',
   buildRunLogRow_({ total: 0, graded: 0, rejected: 0, errors: 0, skipped: 0 }, 'x', 0).length,
   RUN_LOG_HEADERS.length);
+
+// --- rowMatchesSnapshot_ (moved-row guard) ---------------------------------
+check('identical rows match', rowMatchesSnapshot_(['a', 1, ''], ['a', 1, '']) === true);
+check('numbers and dates compare by content',
+  rowMatchesSnapshot_([2, new Date(0)], [2, new Date(0)]) === true);
+check('a changed cell does not match', rowMatchesSnapshot_(['a', 'new'], ['a', 'graded']) === false);
+check('a different width (inserted column) does not match', rowMatchesSnapshot_(['a'], ['a', '']) === false);
+check('missing current row does not match', rowMatchesSnapshot_(['a'], undefined) === false);
+
+// --- gradeNewRows end to end (stubbed Sheets / fetch / properties / lock) ----
+// Minimal in-memory Sheet: enough of getRange/getValues/setValues/appendRow
+// for Grader.js. `grid` is a 2D array, 0-based; the API is 1-based.
+function FakeSheet(grid) { this.grid = grid; }
+FakeSheet.prototype.getLastRow = function () { return this.grid.length; };
+FakeSheet.prototype.getLastColumn = function () {
+  var w = 0;
+  for (var i = 0; i < this.grid.length; i++) w = Math.max(w, this.grid[i].length);
+  return w;
+};
+FakeSheet.prototype.set = function (r, c, v) {
+  while (this.grid.length < r) this.grid.push([]);
+  this.grid[r - 1][c - 1] = v;
+};
+FakeSheet.prototype.getRange = function (r, c, nr, nc) {
+  var self = this; nr = nr || 1; nc = nc || 1;
+  return {
+    getValues: function () {
+      var out = [];
+      for (var i = 0; i < nr; i++) {
+        var line = [];
+        for (var j = 0; j < nc; j++) {
+          var v = (self.grid[r - 1 + i] || [])[c - 1 + j];
+          line.push(v === undefined ? '' : v);
+        }
+        out.push(line);
+      }
+      return out;
+    },
+    setValues: function (vals) {
+      for (var i = 0; i < vals.length; i++)
+        for (var j = 0; j < vals[i].length; j++) self.set(r + i, c + j, vals[i][j]);
+    },
+    setValue: function (v) { self.set(r, c, v); },
+    setFontWeight: function () {}
+  };
+};
+FakeSheet.prototype.appendRow = function (vals) { this.grid.push(vals.slice()); };
+FakeSheet.prototype.setFrozenRows = function () {};
+FakeSheet.prototype.setColumnWidth = function () {};
+
+var cfg = sandbox.GRADER_CONFIG;
+var HEADERS = ['title', 'body', 'status', 'grade', 'reasoning'];
+function dataGrid() {
+  return [
+    HEADERS.slice(),
+    ['Good job', 'great fit', 'new', '', ''],
+    ['Intern role', 'summer', 'new', '', ''],
+    ['Done already', 'x', 'graded', 'A', 'kept']
+  ];
+}
+// Installs the Apps Script globals for one scenario and runs gradeNewRows.
+// `respond(callNumber, sheets)` returns { code, body } for each fetch.
+function runScenario(opts) {
+  var sheets = {};
+  sheets[cfg.DATA_SHEET] = new FakeSheet(opts.data || dataGrid());
+  sheets[cfg.CRITERIA_SHEET] = new FakeSheet([
+    ['field', 'value'], ['criteria_text', 'grade it'], ['exclude_keywords', opts.keywords || '']
+  ]);
+  var ss = {
+    getSheetByName: function (n) { return sheets[n] || null; },
+    insertSheet: function (n) { sheets[n] = new FakeSheet([]); return sheets[n]; }
+  };
+  var calls = 0;
+  sandbox.SpreadsheetApp = { getActiveSpreadsheet: function () { return ss; } };
+  sandbox.PropertiesService = { getScriptProperties: function () {
+    return { getProperty: function () { return 'apiKey' in opts ? opts.apiKey : 'test-key'; } };
+  } };
+  sandbox.LockService = { getScriptLock: function () {
+    return { tryLock: function () { return true; }, releaseLock: function () {} };
+  } };
+  sandbox.UrlFetchApp = { fetch: function () {
+    calls++;
+    var r = opts.respond(calls, sheets);
+    return { getResponseCode: function () { return r.code; }, getContentText: function () { return r.body; } };
+  } };
+  logLines.length = 0;
+  var threw = null;
+  try { gradeNewRows(); } catch (e) { threw = e; }
+  var log = sheets[cfg.LOG_SHEET];
+  return {
+    threw: threw, calls: calls, data: sheets[cfg.DATA_SHEET].grid,
+    // Log-sheet row without run_at / elapsed_sec: [total, graded, rejected, errors, deferred]
+    logRow: log && log.grid.length === 2 ? log.grid[1].slice(1, 6) : null
+  };
+}
+function ok200(content) {
+  return { code: 200, body: JSON.stringify({ choices: [{ message: { content: content } }] }) };
+}
+
+// Happy path: one row graded by the API, one auto-rejected for free, one left alone.
+(function () {
+  var r = runScenario({ keywords: 'intern', respond: function () { return ok200('GRADE: B\nREASONING: Fine.'); } });
+  check('happy path: does not throw', r.threw === null);
+  eq('happy path: API row gets grade/reasoning/status', r.data[1].slice(2), ['graded', 'B', 'Fine.']);
+  check('happy path: keyword row auto-rejected with lowest grade and no API call',
+    r.data[2][2] === 'graded' && r.data[2][3] === 'F' && r.calls === 1);
+  eq('happy path: already-graded row untouched', r.data[3], ['Done already', 'x', 'graded', 'A', 'kept']);
+  eq('happy path: Log row counts', r.logRow, [2, 1, 1, 0, 0]);
+})();
+
+// Missing key: the pre-existing config check still throws before any work.
+(function () {
+  var r = runScenario({ apiKey: null, respond: function () { return ok200('GRADE: B\nREASONING: Fine.'); } });
+  check('missing key: throws naming the property',
+    r.threw !== null && r.threw.message.indexOf(cfg.API_KEY_PROPERTY) !== -1);
+  check('missing key: no API call, no Log row', r.calls === 0 && r.logRow === null);
+})();
+
+// Rejected key: a 401 is fatal -- stop after the first call, write the Log row, throw.
+(function () {
+  var r = runScenario({ keywords: '', respond: function () { return { code: 401, body: '{"error":"invalid api key"}' }; } });
+  check('401: throws', r.threw !== null && /401/.test(r.threw.message));
+  check('401: only one API call made (remaining rows deferred, not retried)', r.calls === 1);
+  eq('401: Log row written first (1 error, 1 deferred)', r.logRow, [2, 0, 0, 1, 1]);
+  check('401: rows keep their status', r.data[1][2] === 'new' && r.data[2][2] === 'new');
+})();
+(function () {
+  var r = runScenario({ keywords: '', respond: function () { return { code: 404, body: 'model not found' }; } });
+  check('404: throws naming the model/endpoint', r.threw !== null && /API_MODEL/.test(r.threw.message));
+})();
+
+// Retired model on a provider that answers 400: no single call is fatal, but a
+// run where every API-graded row failed and none succeeded still throws
+// (after its Log row), even when free auto-rejects happened alongside.
+(function () {
+  var r = runScenario({ keywords: 'intern', respond: function () { return { code: 400, body: 'model_decommissioned' }; } });
+  check('all-failed: throws', r.threw !== null && /failed/.test(r.threw.message));
+  eq('all-failed: Log row written first (1 rejected, 1 error)', r.logRow, [2, 0, 1, 1, 0]);
+  check('all-failed: reject still landed, API row still new', r.data[2][2] === 'graded' && r.data[1][2] === 'new');
+})();
+// A run with at least one success and some per-row errors is not a broken run.
+(function () {
+  var data = dataGrid(); data[2][2] = 'new';
+  var r = runScenario({ data: data, keywords: '', respond: function (n) {
+    return n === 1 ? ok200('GRADE: B\nREASONING: Fine.') : { code: 500, body: 'oops' };
+  } });
+  check('partial failure: does not throw', r.threw === null);
+  eq('partial failure: Log row (1 graded, 1 error)', r.logRow, [2, 1, 0, 1, 0]);
+})();
+
+// Sheet sorted mid-run: the API call succeeds, but the row at that number now
+// holds different data, so the write is skipped and the row is deferred.
+(function () {
+  var r = runScenario({ keywords: 'intern', respond: function (n, sheets) {
+    var g = sheets[cfg.DATA_SHEET].grid;
+    var tmp = g[1]; g[1] = g[2]; g[2] = tmp;  // swap rows 2 and 3, as a sort would
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  check('moved rows: does not throw', r.threw === null);
+  check('moved rows: nothing written to the wrong row',
+    r.data[1][2] === 'new' && r.data[1][3] === '' && r.data[2][2] === 'new' && r.data[2][3] === '');
+  eq('moved rows: both rows deferred in the Log row', r.logRow, [2, 0, 0, 0, 2]);
+  check('moved rows: a SKIP line was logged', logLines.some(function (l) { return l.indexOf('[SKIP]') !== -1; }));
+})();
 
 // --- placeholder sentinel regression guard ---------------------------------
 check('EXCLUDE_KEYWORDS_PLACEHOLDER has no comma (stays a single non-matching token)',
