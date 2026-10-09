@@ -284,11 +284,19 @@ check('numbers and dates compare by content',
 check('a changed cell does not match', rowMatchesSnapshot_(['a', 'new'], ['a', 'graded']) === false);
 check('a different width (inserted column) does not match', rowMatchesSnapshot_(['a'], ['a', '']) === false);
 check('missing current row does not match', rowMatchesSnapshot_(['a'], undefined) === false);
+check('an ignored (formula) cell may change without breaking the match',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['a', 2, 'new'], [false, true, false]) === true);
+check('a non-ignored cell still breaks the match when another is ignored',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['b', 2, 'new'], [false, true, false]) === false);
+check('ignore list does not excuse a width change',
+  rowMatchesSnapshot_(['a', 1], ['a', 1, ''], [false, true]) === false);
 
 // --- gradeNewRows end to end (stubbed Sheets / fetch / properties / lock) ----
-// Minimal in-memory Sheet: enough of getRange/getValues/setValues/appendRow
-// for Grader.js. `grid` is a 2D array, 0-based; the API is 1-based.
-function FakeSheet(grid) { this.grid = grid; }
+// Minimal in-memory Sheet: enough of getRange/getValues/getFormulas/setValues/
+// appendRow for Grader.js. `grid` is a 2D array, 0-based; the API is 1-based.
+// `formulas` (optional) is a parallel 2D array of formula strings; cells not
+// listed read back as '' (a plain value), as the real getFormulas does.
+function FakeSheet(grid, formulas) { this.grid = grid; this.formulas = formulas || []; }
 FakeSheet.prototype.getLastRow = function () { return this.grid.length; };
 FakeSheet.prototype.getLastColumn = function () {
   var w = 0;
@@ -309,6 +317,18 @@ FakeSheet.prototype.getRange = function (r, c, nr, nc) {
         for (var j = 0; j < nc; j++) {
           var v = (self.grid[r - 1 + i] || [])[c - 1 + j];
           line.push(v === undefined ? '' : v);
+        }
+        out.push(line);
+      }
+      return out;
+    },
+    getFormulas: function () {
+      var out = [];
+      for (var i = 0; i < nr; i++) {
+        var line = [];
+        for (var j = 0; j < nc; j++) {
+          var f = (self.formulas[r - 1 + i] || [])[c - 1 + j];
+          line.push(f === undefined ? '' : f);
         }
         out.push(line);
       }
@@ -336,11 +356,15 @@ function dataGrid() {
     ['Done already', 'x', 'graded', 'A', 'kept']
   ];
 }
+function singleRowGrid() {
+  return [HEADERS.slice(), ['Only row', 'solo', 'new', '', '']];
+}
 // Installs the Apps Script globals for one scenario and runs gradeNewRows.
 // `respond(callNumber, sheets)` returns { code, body } for each fetch.
+// `formulas` (optional) marks Data cells as formula-backed, see FakeSheet.
 function runScenario(opts) {
   var sheets = {};
-  sheets[cfg.DATA_SHEET] = new FakeSheet(opts.data || dataGrid());
+  sheets[cfg.DATA_SHEET] = new FakeSheet(opts.data || dataGrid(), opts.formulas);
   sheets[cfg.CRITERIA_SHEET] = new FakeSheet([
     ['field', 'value'], ['criteria_text', 'grade it'], ['exclude_keywords', opts.keywords || '']
   ]);
@@ -439,6 +463,84 @@ function ok200(content) {
     r.data[1][2] === 'new' && r.data[1][3] === '' && r.data[2][2] === 'new' && r.data[2][3] === '');
   eq('moved rows: both rows deferred in the Log row', r.logRow, [2, 0, 0, 0, 2]);
   check('moved rows: a SKIP line was logged', logLines.some(function (l) { return l.indexOf('[SKIP]') !== -1; }));
+})();
+
+// A one-row run that meets one transient provider error (5xx, or a 429 that
+// survives its retry) is not a broken run: no throw, Log row written, row left
+// for the next run. Only failures that would repeat (400, unparseable reply)
+// still trip the all-failed guard.
+(function () {
+  var r = runScenario({ data: singleRowGrid(), respond: function () { return { code: 500, body: 'oops' }; } });
+  check('single-row 500: does not throw', r.threw === null);
+  eq('single-row 500: Log row still records the error', r.logRow, [1, 0, 0, 1, 0]);
+  check('single-row 500: row stays new', r.data[1][2] === 'new');
+  check('single-row 500: transient line logged, not a FATAL',
+    logLines.some(function (l) { return l.indexOf('transient errors') !== -1; }) &&
+    !logLines.some(function (l) { return l.indexOf('FATAL') !== -1; }));
+})();
+(function () {
+  var r = runScenario({ data: singleRowGrid(), respond: function () { return { code: 429, body: 'slow down' }; } });
+  check('single-row 429x2: does not throw', r.threw === null && r.calls === 2);
+  eq('single-row 429x2: Log row', r.logRow, [1, 0, 0, 1, 0]);
+})();
+(function () {
+  var r = runScenario({ data: singleRowGrid(), respond: function () { return { code: 200, body: 'not json' }; } });
+  check('single-row garbage 200 body: transient, does not throw', r.threw === null);
+})();
+(function () {
+  var r = runScenario({ data: singleRowGrid(), respond: function () { return { code: 400, body: 'model_decommissioned' }; } });
+  check('single-row 400: still throws (would repeat)', r.threw !== null && /failed/.test(r.threw.message));
+  eq('single-row 400: Log row written first', r.logRow, [1, 0, 0, 1, 0]);
+})();
+(function () {
+  var r = runScenario({ data: singleRowGrid(), respond: function () { return ok200('I cannot grade this.'); } });
+  check('single-row unparseable reply: still throws, names the token budget',
+    r.threw !== null && /MAX_OUTPUT_TOKENS/.test(r.threw.message));
+})();
+// A whole run of 5xx (provider outage) is logged, not paged; a hard failure
+// anywhere in an otherwise all-failed run still throws.
+(function () {
+  var r = runScenario({ keywords: '', respond: function () { return { code: 503, body: 'down' }; } });
+  check('all-5xx run: does not throw', r.threw === null);
+  eq('all-5xx run: Log row (2 errors)', r.logRow, [2, 0, 0, 2, 0]);
+})();
+(function () {
+  var r = runScenario({ keywords: '', respond: function (n) {
+    return n === 1 ? { code: 500, body: 'oops' } : { code: 400, body: 'bad request' };
+  } });
+  check('500 then 400, nothing graded: throws', r.threw !== null && /failed/.test(r.threw.message));
+})();
+
+// A volatile formula column (=NOW(), =TODAY()-scraped_at) recalculates on every
+// write. Its cells are excluded from the moved-row comparison, so every row
+// still grades -- while a real sort is still caught.
+(function () {
+  var H = HEADERS.concat(['age']);
+  var data = [H, ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1], ['Three', 'c', 'new', '', '', 1]];
+  var formulas = [[], ['', '', '', '', '', '=TODAY()-F2'], ['', '', '', '', '', '=TODAY()-F3'], ['', '', '', '', '', '=TODAY()-F4']];
+  function tick(sheets) {  // recalculation: the volatile cell changes on every call
+    var g = sheets[cfg.DATA_SHEET].grid;
+    for (var i = 1; i < g.length; i++) g[i][5] += 1;
+  }
+  var r = runScenario({ data: data, formulas: formulas, respond: function (n, sheets) {
+    tick(sheets);
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  check('volatile column: does not throw', r.threw === null);
+  eq('volatile column: all rows graded, none deferred', r.logRow, [3, 3, 0, 0, 0]);
+  check('volatile column: grades landed', r.data[1][3] === 'B' && r.data[2][3] === 'B' && r.data[3][3] === 'B');
+
+  // Same sheet, but rows 2 and 3 are also swapped mid-run: still caught.
+  var data2 = [H, ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1]];
+  var r2 = runScenario({ data: data2, formulas: formulas, respond: function (n, sheets) {
+    tick(sheets);
+    if (n === 1) {  // one sort, during the first row's API call
+      var g = sheets[cfg.DATA_SHEET].grid;
+      var tmp = g[1]; g[1] = g[2]; g[2] = tmp;
+    }
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  eq('volatile column + real sort: both rows still deferred', r2.logRow, [2, 0, 0, 0, 2]);
 })();
 
 // --- placeholder sentinel regression guard ---------------------------------

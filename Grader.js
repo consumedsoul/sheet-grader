@@ -286,6 +286,9 @@ function gradeNewRows() {
     // failure is visible in the sheet, and then the run throws so Apps Script
     // emails the trigger owner.
     var fatalMessage = null;
+    // Errors that will repeat on the next run (400s, unparseable replies), as
+    // opposed to transient 429/5xx blips. Only these feed the all-failed guard.
+    var hardErrors = 0;
     // Only pace against the API rate limit after an actual API call. Stage-1
     // auto-rejects make no call, so the row after one starts with no delay.
     var pauseMs = 0;
@@ -305,6 +308,7 @@ function gradeNewRows() {
 
       var result = gradeOneRow_(sheet, rows[i], cols, criteriaText, excludeKeywords, apiKey);
       stats[result.outcome]++;
+      if (result.outcome === 'errors' && !result.transient) hardErrors++;
       pauseMs = result.madeApiCall ? GRADER_CONFIG.API_DELAY_MS : 0;
       if (result.fatal) {
         // Every remaining row would fail the same way; stop burning calls.
@@ -332,12 +336,20 @@ function gradeNewRows() {
 
     // A run in which every API-bound row failed is a broken run, not a quiet
     // one -- a revoked key, a retired model or a wrong endpoint (providers that
-    // answer those with 400 or 5xx don't trip the fatal path above). The rows
-    // are still ungraded and the Log row records the failure, but only a throw
-    // gets the trigger owner emailed.
-    if (!fatalMessage && stats.graded === 0 && stats.errors > 0) {
+    // answer those with 400 don't trip the fatal path above), or replies the
+    // parser can't read. The rows are still ungraded and the Log row records
+    // the failure, but only a throw gets the trigger owner emailed.
+    // Transient failures (429 after retry, 5xx) are deliberately left out: an
+    // hourly trigger that finds one row and meets one provider blip would
+    // otherwise page the owner with a message blaming the key. Those rows stay
+    // ungraded and are retried next run, and the Log row's `errors` shows them.
+    if (!fatalMessage && stats.graded === 0 && hardErrors > 0) {
       fatalMessage = 'All ' + stats.errors + ' API-graded row(s) failed and none succeeded -- check ' +
-        GRADER_CONFIG.API_KEY_PROPERTY + ', API_MODEL and API_ENDPOINT; see the log above.';
+        GRADER_CONFIG.API_KEY_PROPERTY + ', API_MODEL and API_ENDPOINT' +
+        ' (or MAX_OUTPUT_TOKENS / REASONING_EFFORT if the log shows parse failures); see the log above.';
+    } else if (!fatalMessage && stats.graded === 0 && stats.errors > 0) {
+      Logger.log('All ' + stats.errors + ' API-graded row(s) hit transient errors (rate limit or provider outage). ' +
+        'Not treating this as a broken run; the rows stay ungraded and will be retried next run.');
     }
     if (fatalMessage) throw new Error(fatalMessage);
 
@@ -389,9 +401,12 @@ function resolveColumns_(colMap, dupKeys) {
  * Grades a single row and writes the result back. Runs Stage 1 (cheap exclude-
  * keyword reject, no API call) then Stage 2 (LLM) only if the row survives.
  *
- * Returns { outcome, madeApiCall } where outcome is one of 'graded', 'rejected',
- * or 'errors' (keyed to match the stats object) and madeApiCall tells the caller
- * whether to pace against the rate limit.
+ * Returns { outcome, madeApiCall, fatal, transient } where outcome is one of
+ * 'graded', 'rejected', 'skipped' or 'errors' (keyed to match the stats object),
+ * madeApiCall tells the caller whether to pace against the rate limit, `fatal`
+ * is an error message when the run should stop, and `transient` is true when
+ * an 'errors' outcome was a provider blip (429/5xx) rather than a failure that
+ * will repeat -- the caller leaves those out of the all-calls-failed guard.
  */
 function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
   var titleHint = guessRowTitle_(row);
@@ -438,7 +453,12 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
     Logger.log('  [ERR] Exception on ' + titleHint + ': ' + apiErr.message);
     // `fatal` marks a failure every later row would repeat (see callLlmApi_);
     // the caller stops the run on it instead of counting it per row.
-    return { outcome: 'errors', madeApiCall: true, fatal: apiErr.fatal ? apiErr.message : null };
+    // `transient` marks a provider blip the caller should not page over.
+    return {
+      outcome: 'errors', madeApiCall: true,
+      fatal: apiErr.fatal ? apiErr.message : null,
+      transient: !!apiErr.transient
+    };
   }
 }
 
@@ -595,26 +615,37 @@ function isGradableStatus_(rawStatus) {
 
 /**
  * Returns row objects whose status is gradable (see isGradableStatus_), each
- * tagged with _row (its 1-based sheet row number) and _snapshot (the raw cell
- * values read here, which rowStillInPlace_ re-checks before any write). Every
- * iterator over a row skips "_"-prefixed keys.
+ * tagged with _row (its 1-based sheet row number), _snapshot (the raw cell
+ * values read here, which rowStillInPlace_ re-checks before any write) and
+ * _formulaCells (true for each cell that holds a formula, so the re-check can
+ * ignore it). Every iterator over a row skips "_"-prefixed keys.
  */
 function getUngradedRows_(sheet, headers, colMap) {
   var lastRow = sheet.getLastRow();
   if (lastRow <= 1) return [];
 
-  var data = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  var range = sheet.getRange(2, 1, lastRow - 1, headers.length);
+  var data = range.getValues();
+  // Formula cells recalculate on their own -- =NOW(), =TODAY()-scraped_at,
+  // =RAND() -- and every grade written is a sheet edit that recalculates them.
+  // Comparing their values would make almost every row look "changed" after
+  // the first write, so rowStillInPlace_ skips them. One read for the whole
+  // range; '' means the cell holds a plain value.
+  var formulas = range.getFormulas();
   var statusIdx = colMap[GRADER_CONFIG.STATUS_COLUMN] - 1;
   var rows = [];
 
   for (var i = 0; i < data.length; i++) {
     if (isGradableStatus_(data[i][statusIdx])) {
       var row = {};
+      var formulaCells = [];
       for (var j = 0; j < headers.length; j++) {
         row[headers[j].toString().trim().toLowerCase()] = data[i][j];
+        formulaCells.push(!!(formulas[i] && formulas[i][j]));
       }
       row._row = i + 2;
       row._snapshot = data[i];
+      row._formulaCells = formulaCells;
       rows.push(row);
     }
   }
@@ -627,19 +658,23 @@ function getUngradedRows_(sheet, headers, colMap) {
  * up to TIMER_BUDGET_SEC, and sorting the Data tab (or inserting rows above)
  * in that window renumbers every row -- without this check the grade would
  * land on whichever row now sits at that number. Costs one read per write.
+ * Cells that held a formula at snapshot time are not compared (see
+ * getUngradedRows_); a volatile column must not make every row look moved.
  */
 function rowStillInPlace_(sheet, row) {
   var current = sheet.getRange(row._row, 1, 1, row._snapshot.length).getValues()[0];
-  return rowMatchesSnapshot_(row._snapshot, current);
+  return rowMatchesSnapshot_(row._snapshot, current, row._formulaCells);
 }
 
 /**
  * Pure cell-by-cell comparison behind rowStillInPlace_. Values are compared as
  * strings so dates and numbers read back from the sheet compare by content.
+ * `ignore` (optional) is a parallel array of booleans; true skips that cell.
  */
-function rowMatchesSnapshot_(snapshot, current) {
+function rowMatchesSnapshot_(snapshot, current, ignore) {
   if (!snapshot || !current || snapshot.length !== current.length) return false;
   for (var i = 0; i < snapshot.length; i++) {
+    if (ignore && ignore[i]) continue;
     if (String(snapshot[i]) !== String(current[i])) return false;
   }
   return true;
@@ -728,11 +763,18 @@ function checkExcludeKeywords_(row, excludeKeywords) {
 
 /**
  * Posts a single prompt to the configured OpenAI-compatible endpoint.
- * Returns response text, or null on a per-call error (bad JSON, 5xx, a 429
- * that survives the one retry). Throws an Error tagged `fatal` on HTTP
- * 401/403/404 -- a rejected key, or an unknown model/endpoint -- because every
- * later call in the run would fail the same way; gradeOneRow_ passes that up
- * and gradeNewRows stops the run and rethrows so the trigger owner is emailed.
+ * Returns response text, or null when the reply is 200 but not in the shape
+ * expected (a provider that doesn't speak this wire format), or on an HTTP
+ * error this code has no better name for (400 etc.).
+ *
+ * Two kinds of failure throw a tagged Error instead, so gradeOneRow_ can tell
+ * them apart:
+ *   `transient` -- a 429 that survives the one retry, a 5xx, or an unparseable
+ *     200 body. A provider blip: the next call (or the next run) will likely
+ *     succeed, so these never count toward the all-calls-failed guard.
+ *   `fatal` -- HTTP 401/403/404: a rejected key, or an unknown model/endpoint.
+ *     Every later call in the run would fail the same way; gradeOneRow_ passes
+ *     it up and gradeNewRows stops the run and rethrows so the owner is emailed.
  */
 function callLlmApi_(apiKey, prompt) {
   var payload = {
@@ -778,8 +820,7 @@ function callLlmApi_(apiKey, prompt) {
         Logger.log('  Unexpected response structure');
         return null;
       } catch (e) {
-        Logger.log('  Failed to parse JSON: ' + e.message);
-        return null;
+        throw transientError_('Failed to parse JSON: ' + e.message);
       }
     }
 
@@ -797,10 +838,22 @@ function callLlmApi_(apiKey, prompt) {
       throw fatal;
     }
 
+    if (code === 429 || code >= 500) {
+      throw transientError_('API error ' + code + ' (rate limit / provider outage, will retry next run): ' +
+        response.getContentText().substring(0, 200));
+    }
+
     Logger.log('  API error ' + code + ': ' + response.getContentText().substring(0, 200));
     return null;
   }
   return null;
+}
+
+/** An Error tagged `transient` -- see callLlmApi_. */
+function transientError_(message) {
+  var err = new Error(message);
+  err.transient = true;
+  return err;
 }
 
 

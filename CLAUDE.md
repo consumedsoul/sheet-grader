@@ -42,8 +42,9 @@ generic and keep the README honest. It is not wired up to a live spreadsheet her
 real Apps Script services only run bound to a real sheet — but the Node test harness
 (`npm test` / `tests/run.js`) exercises the real `Grader.js` source: the pure helpers
 directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/fetch
-(happy path, rejected key, retired model, row moved mid-run). Run it after touching
-anything; add a scenario there when touching the loop or a failure path.
+(happy path, rejected key, retired model, transient blip, row moved mid-run, volatile
+formula column). Run it after touching anything; add a scenario there when touching the
+loop or a failure path.
 
 ## Architecture (one file, top-down in `Grader.js`)
 
@@ -56,12 +57,15 @@ anything; add a scenario there when touching the loop or a failure path.
   (`resolveColumns_`), then loops rows calling `gradeOneRow_` and pacing against the rate
   limit. Respects a timer budget so it can resume across runs.
 - `gradeOneRow_` — Stage 1 (regex reject, no API call) → Stage 2 (LLM) → write back for a
-  single row. Returns `{ outcome, madeApiCall, fatal }`; the caller uses `outcome` for
-  stats, `madeApiCall` to decide whether to sleep (auto-rejects don't sleep), and `fatal`
-  (an error message, set when `callLlmApi_` threw a `fatal`-tagged error) to stop the run.
+  single row. Returns `{ outcome, madeApiCall, fatal, transient }`; the caller uses
+  `outcome` for stats, `madeApiCall` to decide whether to sleep (auto-rejects don't
+  sleep), `fatal` (an error message, set when `callLlmApi_` threw a `fatal`-tagged error)
+  to stop the run, and `transient` (set when it threw a `transient`-tagged 429/5xx error)
+  to leave that error out of the all-failed guard.
   Before either write it calls `rowStillInPlace_`, which re-reads the row and compares it
-  to the `_snapshot` taken by `getUngradedRows_`; a mismatch skips the write (outcome
-  `skipped`) so a sort mid-run can't put a grade on the wrong row.
+  to the `_snapshot` taken by `getUngradedRows_`, skipping cells flagged in
+  `_formulaCells`; a mismatch skips the write (outcome `skipped`) so a sort mid-run can't
+  put a grade on the wrong row.
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
   `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
@@ -82,7 +86,7 @@ anything; add a scenario there when touching the loop or a failure path.
   `resolveColumns_`, the Criteria sheet via `parseCriteriaValues_` (which falls back to
   the first two columns only when the `field`/`value` headers are missing).
 - **Private helpers end in `_`** (Apps Script hides them from the Run menu).
-- **Row-object keys starting with `_` are internal** (`_row`, `_snapshot`). Every
+- **Row-object keys starting with `_` are internal** (`_row`, `_snapshot`, `_formulaCells`). Every
   iterator over a row skips them, and a Data-sheet header starting with `_` is ignored
   with a warning.
 - **The rubric lives in the sheet, not the code.** That keeps the user's prompt out of
@@ -122,9 +126,14 @@ anything; add a scenario there when touching the loop or a failure path.
   `getOrCreateCriteria_`, since README step 8 tells the user to expect it).
   A *present but rejected* key or a retired model must throw too: `callLlmApi_` throws a
   `fatal`-tagged error on 401/403/404 (the loop stops at that row), and after the loop a
-  run with `graded === 0 && errors > 0` throws as well. Both happen *after* the Log row
-  is written, so the sheet shows the failure and the owner still gets the email. The
-  per-row `try/catch` in `gradeOneRow_` must keep passing `fatal` up, not swallow it.
+  run with `graded === 0` and at least one *hard* error (400, unparseable reply) throws
+  as well. Both happen *after* the Log row is written, so the sheet shows the failure and
+  the owner still gets the email. The per-row `try/catch` in `gradeOneRow_` must keep
+  passing `fatal` up, not swallow it.
+  Transient errors are the one exception: `callLlmApi_` throws a `transient`-tagged error
+  on a 429 that survives its retry, a 5xx, or a garbage 200 body, and those never feed
+  the all-failed guard — a one-row hourly run meeting one Groq blip must not email the
+  owner about the key. Don't let a 5xx back into the hard count.
 
 ## Required Script Properties
 
@@ -144,15 +153,22 @@ anything; add a scenario there when touching the loop or a failure path.
   in-memory Sheets/fetch stand-ins. Real Sheets and network behavior still only run bound
   to a sheet.
 - A row that moves or changes mid-run is skipped and deferred, not graded. Legit mid-run
-  edits to a row's cells therefore push that row to the next run (one extra API call).
+  edits to a row's *plain-value* cells therefore push that row to the next run (one extra
+  API call). Formula cells are excluded from the check, so a change that only shows up
+  through a formula is not caught.
+- A provider outage that fails every row in a run no longer emails the owner (transient
+  errors don't trip the all-failed guard). It shows as `errors` in the Log sheet instead.
 
 ## Safe-change checklist
 
 - Touching the loop? Preserve resumability (timer budget) and per-row writes, keep the
   rate-limit sleep gated on `madeApiCall` so auto-rejects stay free, keep the `fatal` break
-  and the all-failed throw after the Log write, and keep `stats.skipped` additive (`+=`) —
-  moved rows and the timer budget both feed it. Add a scenario to the end-to-end section of
-  `tests/run.js`.
+  and the all-failed throw after the Log write (fed by `hardErrors`, not `stats.errors`),
+  and keep `stats.skipped` additive (`+=`) — moved rows and the timer budget both feed it.
+  Add a scenario to the end-to-end section of `tests/run.js`.
+- Changing `rowStillInPlace_` / `getUngradedRows_`? Keep `_formulaCells` in step with
+  `_snapshot` (same width, read from the same range) — a volatile formula column
+  otherwise defers every row after paying for its API call.
 - Adding a provider? Usually only `API_ENDPOINT` / `API_MODEL` / key need to change —
   plus `REASONING_EFFORT`, which is only sent when non-empty; blank it for providers
   that reject the parameter. One exception: `MAX_OUTPUT_TOKENS` goes out as

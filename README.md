@@ -91,7 +91,9 @@ A few details worth knowing:
   Each row is re-read right before its grade is written. If it has moved or
   changed since the run started, the write is skipped with a warning, the row
   counts as `deferred`, and it's graded on the next run — rather than landing
-  on whatever row now sits at that number.
+  on whatever row now sits at that number. Cells that hold a formula are left
+  out of that comparison, so a volatile column (`=NOW()`, `=TODAY()-scraped_at`,
+  `=RAND()`) that recalculates on every write doesn't make every row look moved.
 
 ## Setup
 
@@ -259,8 +261,15 @@ A run whose API calls all fail — a revoked or rotated key, a retired model, a
 wrong endpoint — is also treated as broken, not quiet: it writes its Log row
 (so the `errors` column shows it) *and then* throws, so you still get the
 email. A `401`, `403` or `404` stops the run at the first row instead of
-retrying every row; a provider that answers with `400` or a server error is
-caught at the end of the run, when no API-graded row succeeded.
+retrying every row; a provider that answers with `400`, or replies the parser
+can't read, is caught at the end of the run, when no API-graded row succeeded.
+
+Transient errors — a `429` that survives its retry, or a `5xx` server error —
+don't count toward that. A one-row run that meets one provider blip logs the
+error, leaves the row `new` for the next run, and exits quietly; otherwise an
+hourly trigger would email you about a key problem that doesn't exist. A
+provider outage therefore shows up as a run of `errors` in the Log sheet rather
+than an email.
 
 ## Configuration
 
