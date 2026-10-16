@@ -91,9 +91,13 @@ A few details worth knowing:
   Each row is re-read right before its grade is written. If it has moved or
   changed since the run started, the write is skipped with a warning, the row
   counts as `deferred`, and it's graded on the next run — rather than landing
-  on whatever row now sits at that number. Cells that hold a formula are left
-  out of that comparison, so a volatile column (`=NOW()`, `=TODAY()-scraped_at`,
-  `=RAND()`) that recalculates on every write doesn't make every row look moved.
+  on whatever row now sits at that number. Cells that hold a formula are
+  compared by their formula text rather than their value, so a volatile column
+  (`=NOW()`, `=TODAY()-scraped_at`, `=RAND()`) that recalculates on every write
+  doesn't make every row look moved, while a sort — which moves each row's
+  formulas along with it — is still caught even when every content column is a
+  formula. What this can't see is a change in a formula's *inputs* (an edit on
+  the tab a `=VLOOKUP` reads from) while a run is in progress.
 
 ## Setup
 
@@ -261,8 +265,10 @@ A run whose API calls all fail — a revoked or rotated key, a retired model, a
 wrong endpoint — is also treated as broken, not quiet: it writes its Log row
 (so the `errors` column shows it) *and then* throws, so you still get the
 email. A `401`, `403` or `404` stops the run at the first row instead of
-retrying every row; a provider that answers with `400`, or replies the parser
-can't read, is caught at the end of the run, when no API-graded row succeeded.
+retrying every row; a provider that answers with `400`, replies the parser
+can't read, or answers `200` with something that isn't JSON (an HTML page from
+a wrong endpoint, a proxy or a login wall) is caught at the end of the run,
+when no API-graded row succeeded.
 
 Transient errors — a `429` that survives its retry, or a `5xx` server error —
 don't count toward that. A one-row run that meets one provider blip logs the
@@ -351,9 +357,10 @@ npm test        # or: node tests/run.js
 It loads the real `Grader.js` into a sandbox with the Apps Script globals
 stubbed, so the assertions run against the actual source. It also runs
 `gradeNewRows` end to end against in-memory stand-ins for the Sheets and fetch
-services, covering the happy path, a rejected key, a retired model and a row
-that moves mid-run. Real Sheets and network behavior still only run bound to a
-real spreadsheet.
+services, covering the happy path, a rejected key, a retired model, a
+transient provider blip, a non-JSON `200`, a row that moves mid-run, a volatile
+formula column, and formula-backed content columns sorted mid-run. Real Sheets
+and network behavior still only run bound to a real spreadsheet.
 
 ## License
 

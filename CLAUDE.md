@@ -26,6 +26,15 @@ last. An ask buried in the middle is an ask he will miss.
   options you have already thought through, not doing the thinking from scratch.
 - Plain language. If a technical term is load-bearing, define it in the same sentence in
   six words or fewer. Name the file, page, or button — not the abstraction.
+- Any ask to do something in the Apps Script editor carries all three of: the editor
+  URL, the file to click (`Grader.gs`, the editor's name for `Grader.js`), and the exact
+  function name to pick in the Run dropdown, e.g. "open <URL>, click `Grader.gs`, pick
+  `gradeNewRows` and press Run" (asked for 2026-10-08).
+- This repo does not store the Script ID (`.clasp.json` is gitignored), so the editor URL
+  is not knowable from here. The first time you need it, ask Hun once for the URL
+  (in the sheet: Extensions > Apps Script, then copy the address bar), and add it on the
+  line below so no later session has to ask:
+  `https://script.google.com/home/projects/<SCRIPT_ID>/edit`
 - Lead with what changed and what he can see. Reasoning and internals go below that, or
   are left out unless he asks.
 
@@ -42,9 +51,9 @@ generic and keep the README honest. It is not wired up to a live spreadsheet her
 real Apps Script services only run bound to a real sheet — but the Node test harness
 (`npm test` / `tests/run.js`) exercises the real `Grader.js` source: the pure helpers
 directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/fetch
-(happy path, rejected key, retired model, transient blip, row moved mid-run, volatile
-formula column). Run it after touching anything; add a scenario there when touching the
-loop or a failure path.
+(happy path, rejected key, retired model, transient blip, non-JSON 200, row moved mid-run,
+volatile formula column, formula-backed rows sorted mid-run). Run it after touching
+anything; add a scenario there when touching the loop or a failure path.
 
 ## Architecture (one file, top-down in `Grader.js`)
 
@@ -63,9 +72,9 @@ loop or a failure path.
   to stop the run, and `transient` (set when it threw a `transient`-tagged 429/5xx error)
   to leave that error out of the all-failed guard.
   Before either write it calls `rowStillInPlace_`, which re-reads the row and compares it
-  to the `_snapshot` taken by `getUngradedRows_`, skipping cells flagged in
-  `_formulaCells`; a mismatch skips the write (outcome `skipped`) so a sort mid-run can't
-  put a grade on the wrong row.
+  to the `_snapshot` taken by `getUngradedRows_`, comparing cells that held a formula by
+  their `_formulas` text instead of their value; a mismatch skips the write (outcome
+  `skipped`) so a sort mid-run can't put a grade on the wrong row.
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
   `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
@@ -86,7 +95,7 @@ loop or a failure path.
   `resolveColumns_`, the Criteria sheet via `parseCriteriaValues_` (which falls back to
   the first two columns only when the `field`/`value` headers are missing).
 - **Private helpers end in `_`** (Apps Script hides them from the Run menu).
-- **Row-object keys starting with `_` are internal** (`_row`, `_snapshot`, `_formulaCells`). Every
+- **Row-object keys starting with `_` are internal** (`_row`, `_snapshot`, `_formulas`). Every
   iterator over a row skips them, and a Data-sheet header starting with `_` is ignored
   with a warning.
 - **The rubric lives in the sheet, not the code.** That keeps the user's prompt out of
@@ -126,14 +135,18 @@ loop or a failure path.
   `getOrCreateCriteria_`, since README step 8 tells the user to expect it).
   A *present but rejected* key or a retired model must throw too: `callLlmApi_` throws a
   `fatal`-tagged error on 401/403/404 (the loop stops at that row), and after the loop a
-  run with `graded === 0` and at least one *hard* error (400, unparseable reply) throws
+  run with `graded === 0` and at least one *hard* error (400, unparseable reply, a 200
+  whose body isn't JSON) throws
   as well. Both happen *after* the Log row is written, so the sheet shows the failure and
   the owner still gets the email. The per-row `try/catch` in `gradeOneRow_` must keep
   passing `fatal` up, not swallow it.
   Transient errors are the one exception: `callLlmApi_` throws a `transient`-tagged error
-  on a 429 that survives its retry, a 5xx, or a garbage 200 body, and those never feed
-  the all-failed guard — a one-row hourly run meeting one Groq blip must not email the
-  owner about the key. Don't let a 5xx back into the hard count.
+  on a 429 that survives its retry or a 5xx, and those never feed the all-failed guard —
+  a one-row hourly run meeting one Groq blip must not email the owner about the key.
+  Don't let a 5xx back into the hard count. The reverse holds for a 200 whose body isn't
+  JSON: that is a wrong `API_ENDPOINT`, a proxy or a login page, it repeats on every run,
+  and `callLlmApi_` returns `null` (hard) for it — never tag it `transient`, or a
+  misconfigured endpoint fails quietly forever.
 
 ## Required Script Properties
 
@@ -154,8 +167,8 @@ loop or a failure path.
   to a sheet.
 - A row that moves or changes mid-run is skipped and deferred, not graded. Legit mid-run
   edits to a row's *plain-value* cells therefore push that row to the next run (one extra
-  API call). Formula cells are excluded from the check, so a change that only shows up
-  through a formula is not caught.
+  API call). Formula cells are compared by formula text, not value, so a change in a
+  formula's *inputs* (an edit on the tab a `=VLOOKUP` reads from) is not caught.
 - A provider outage that fails every row in a run no longer emails the owner (transient
   errors don't trip the all-failed guard). It shows as `errors` in the Log sheet instead.
 
@@ -166,9 +179,11 @@ loop or a failure path.
   and the all-failed throw after the Log write (fed by `hardErrors`, not `stats.errors`),
   and keep `stats.skipped` additive (`+=`) — moved rows and the timer budget both feed it.
   Add a scenario to the end-to-end section of `tests/run.js`.
-- Changing `rowStillInPlace_` / `getUngradedRows_`? Keep `_formulaCells` in step with
-  `_snapshot` (same width, read from the same range) — a volatile formula column
-  otherwise defers every row after paying for its API call.
+- Changing `rowStillInPlace_` / `getUngradedRows_`? Keep `_formulas` in step with
+  `_snapshot` (same width, read from the same range), and compare formula cells by text,
+  never by value and never by skipping them — a volatile formula column otherwise defers
+  every row after paying for its API call, and skipping them outright put grades on the
+  wrong rows when every content column was a formula (2026-10-16 audit).
 - Adding a provider? Usually only `API_ENDPOINT` / `API_MODEL` / key need to change —
   plus `REASONING_EFFORT`, which is only sent when non-empty; blank it for providers
   that reject the parameter. One exception: `MAX_OUTPUT_TOKENS` goes out as

@@ -617,8 +617,9 @@ function isGradableStatus_(rawStatus) {
  * Returns row objects whose status is gradable (see isGradableStatus_), each
  * tagged with _row (its 1-based sheet row number), _snapshot (the raw cell
  * values read here, which rowStillInPlace_ re-checks before any write) and
- * _formulaCells (true for each cell that holds a formula, so the re-check can
- * ignore it). Every iterator over a row skips "_"-prefixed keys.
+ * _formulas (the formula text of each cell, '' for a plain value, so the
+ * re-check can compare formula cells by text instead of by recalculated
+ * value). Every iterator over a row skips "_"-prefixed keys.
  */
 function getUngradedRows_(sheet, headers, colMap) {
   var lastRow = sheet.getLastRow();
@@ -629,8 +630,10 @@ function getUngradedRows_(sheet, headers, colMap) {
   // Formula cells recalculate on their own -- =NOW(), =TODAY()-scraped_at,
   // =RAND() -- and every grade written is a sheet edit that recalculates them.
   // Comparing their values would make almost every row look "changed" after
-  // the first write, so rowStillInPlace_ skips them. One read for the whole
-  // range; '' means the cell holds a plain value.
+  // the first write, so rowStillInPlace_ compares their formula text instead:
+  // a recalculation leaves the text alone, while a sort carries each row's
+  // formulas (=Src!A2 vs =Src!A3) along with it. One read for the whole range;
+  // '' means the cell holds a plain value.
   var formulas = range.getFormulas();
   var statusIdx = colMap[GRADER_CONFIG.STATUS_COLUMN] - 1;
   var rows = [];
@@ -638,14 +641,14 @@ function getUngradedRows_(sheet, headers, colMap) {
   for (var i = 0; i < data.length; i++) {
     if (isGradableStatus_(data[i][statusIdx])) {
       var row = {};
-      var formulaCells = [];
+      var rowFormulas = [];
       for (var j = 0; j < headers.length; j++) {
         row[headers[j].toString().trim().toLowerCase()] = data[i][j];
-        formulaCells.push(!!(formulas[i] && formulas[i][j]));
+        rowFormulas.push((formulas[i] && formulas[i][j]) || '');
       }
       row._row = i + 2;
       row._snapshot = data[i];
-      row._formulaCells = formulaCells;
+      row._formulas = rowFormulas;
       rows.push(row);
     }
   }
@@ -658,23 +661,38 @@ function getUngradedRows_(sheet, headers, colMap) {
  * up to TIMER_BUDGET_SEC, and sorting the Data tab (or inserting rows above)
  * in that window renumbers every row -- without this check the grade would
  * land on whichever row now sits at that number. Costs one read per write.
- * Cells that held a formula at snapshot time are not compared (see
- * getUngradedRows_); a volatile column must not make every row look moved.
+ * Cells that held a formula at snapshot time are compared by formula text, not
+ * value (see getUngradedRows_): a volatile column must not make every row look
+ * moved, but a row whose formulas moved with it must. The formulas are only
+ * re-read when the snapshot has a formula cell, so a plain sheet pays one read.
  */
 function rowStillInPlace_(sheet, row) {
-  var current = sheet.getRange(row._row, 1, 1, row._snapshot.length).getValues()[0];
-  return rowMatchesSnapshot_(row._snapshot, current, row._formulaCells);
+  var range = sheet.getRange(row._row, 1, 1, row._snapshot.length);
+  var current = range.getValues()[0];
+  var snapFormulas = row._formulas || [];
+  var currentFormulas = null;
+  for (var i = 0; i < snapFormulas.length; i++) {
+    if (snapFormulas[i]) { currentFormulas = range.getFormulas()[0]; break; }
+  }
+  return rowMatchesSnapshot_(row._snapshot, current, snapFormulas, currentFormulas);
 }
 
 /**
  * Pure cell-by-cell comparison behind rowStillInPlace_. Values are compared as
  * strings so dates and numbers read back from the sheet compare by content.
- * `ignore` (optional) is a parallel array of booleans; true skips that cell.
+ * `snapFormulas` / `curFormulas` (optional) are parallel arrays of formula text
+ * ('' for a plain value). A cell that held a formula at snapshot time matches
+ * on formula text only: its recalculated value is free to change, but it must
+ * still hold the same formula (a moved row brings its own along, and an
+ * overwritten formula reads back as '').
  */
-function rowMatchesSnapshot_(snapshot, current, ignore) {
+function rowMatchesSnapshot_(snapshot, current, snapFormulas, curFormulas) {
   if (!snapshot || !current || snapshot.length !== current.length) return false;
   for (var i = 0; i < snapshot.length; i++) {
-    if (ignore && ignore[i]) continue;
+    if (snapFormulas && snapFormulas[i]) {
+      if (!curFormulas || String(snapFormulas[i]) !== String(curFormulas[i])) return false;
+      continue;
+    }
     if (String(snapshot[i]) !== String(current[i])) return false;
   }
   return true;
@@ -763,15 +781,17 @@ function checkExcludeKeywords_(row, excludeKeywords) {
 
 /**
  * Posts a single prompt to the configured OpenAI-compatible endpoint.
- * Returns response text, or null when the reply is 200 but not in the shape
- * expected (a provider that doesn't speak this wire format), or on an HTTP
- * error this code has no better name for (400 etc.).
+ * Returns response text, or null when the reply is 200 but isn't JSON or isn't
+ * in the shape expected (a wrong API_ENDPOINT serving an HTML page, a proxy or
+ * login wall, a provider that doesn't speak this wire format), or on an HTTP
+ * error this code has no better name for (400 etc.). A null is a hard failure:
+ * it repeats on every call, so it counts toward the all-calls-failed guard.
  *
  * Two kinds of failure throw a tagged Error instead, so gradeOneRow_ can tell
  * them apart:
- *   `transient` -- a 429 that survives the one retry, a 5xx, or an unparseable
- *     200 body. A provider blip: the next call (or the next run) will likely
- *     succeed, so these never count toward the all-calls-failed guard.
+ *   `transient` -- a 429 that survives the one retry, or a 5xx. A provider
+ *     blip: the next call (or the next run) will likely succeed, so these never
+ *     count toward the all-calls-failed guard.
  *   `fatal` -- HTTP 401/403/404: a rejected key, or an unknown model/endpoint.
  *     Every later call in the run would fail the same way; gradeOneRow_ passes
  *     it up and gradeNewRows stops the run and rethrows so the owner is emailed.
@@ -820,7 +840,13 @@ function callLlmApi_(apiKey, prompt) {
         Logger.log('  Unexpected response structure');
         return null;
       } catch (e) {
-        throw transientError_('Failed to parse JSON: ' + e.message);
+        // A 200 that isn't JSON is almost never a provider blip -- it's an HTML
+        // page from a wrong API_ENDPOINT, a proxy or a login wall, and it will
+        // repeat on every run. Hard failure (null), not transient, so a run of
+        // nothing but these still emails the owner.
+        Logger.log('  Response was 200 but not JSON (wrong API_ENDPOINT, or a proxy/login page?): ' +
+          response.getContentText().substring(0, 200));
+        return null;
       }
     }
 

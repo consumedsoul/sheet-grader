@@ -284,12 +284,21 @@ check('numbers and dates compare by content',
 check('a changed cell does not match', rowMatchesSnapshot_(['a', 'new'], ['a', 'graded']) === false);
 check('a different width (inserted column) does not match', rowMatchesSnapshot_(['a'], ['a', '']) === false);
 check('missing current row does not match', rowMatchesSnapshot_(['a'], undefined) === false);
-check('an ignored (formula) cell may change without breaking the match',
-  rowMatchesSnapshot_(['a', 1, 'new'], ['a', 2, 'new'], [false, true, false]) === true);
-check('a non-ignored cell still breaks the match when another is ignored',
-  rowMatchesSnapshot_(['a', 1, 'new'], ['b', 2, 'new'], [false, true, false]) === false);
-check('ignore list does not excuse a width change',
-  rowMatchesSnapshot_(['a', 1], ['a', 1, ''], [false, true]) === false);
+var F = ['', '=TODAY()-F2', ''];
+check('a formula cell may change value without breaking the match (same formula text)',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['a', 2, 'new'], F, F) === true);
+check('a formula cell whose formula text changed does not match (a moved row brings its own)',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['a', 1, 'new'], ['', '=Src!A2', ''], ['', '=Src!A3', '']) === false);
+check('a formula cell overwritten with a plain value does not match',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['a', 1, 'new'], F, ['', '', '']) === false);
+check('a formula cell with no current formulas to compare does not match',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['a', 1, 'new'], F, null) === false);
+check('a plain cell still breaks the match when a formula cell is text-compared',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['b', 2, 'new'], F, F) === false);
+check('formula text does not excuse a width change',
+  rowMatchesSnapshot_(['a', 1], ['a', 1, ''], ['', '=X'], ['', '=X', '']) === false);
+check('all-plain formula arrays fall back to value comparison',
+  rowMatchesSnapshot_(['a', 1], ['a', 2], ['', ''], ['', '']) === false);
 
 // --- gradeNewRows end to end (stubbed Sheets / fetch / properties / lock) ----
 // Minimal in-memory Sheet: enough of getRange/getValues/getFormulas/setValues/
@@ -343,6 +352,12 @@ FakeSheet.prototype.getRange = function (r, c, nr, nc) {
   };
 };
 FakeSheet.prototype.appendRow = function (vals) { this.grid.push(vals.slice()); };
+// A mid-run sort, as Sheets does it: a row's values AND its formulas move together.
+FakeSheet.prototype.swapRows = function (a, b) {
+  var g = this.grid, f = this.formulas, t;
+  t = g[a - 1]; g[a - 1] = g[b - 1]; g[b - 1] = t;
+  t = f[a - 1]; f[a - 1] = f[b - 1]; f[b - 1] = t;
+};
 FakeSheet.prototype.setFrozenRows = function () {};
 FakeSheet.prototype.setColumnWidth = function () {};
 
@@ -454,8 +469,7 @@ function ok200(content) {
 // holds different data, so the write is skipped and the row is deferred.
 (function () {
   var r = runScenario({ keywords: 'intern', respond: function (n, sheets) {
-    var g = sheets[cfg.DATA_SHEET].grid;
-    var tmp = g[1]; g[1] = g[2]; g[2] = tmp;  // swap rows 2 and 3, as a sort would
+    sheets[cfg.DATA_SHEET].swapRows(2, 3);  // as a sort would
     return ok200('GRADE: B\nREASONING: Fine.');
   } });
   check('moved rows: does not throw', r.threw === null);
@@ -467,8 +481,8 @@ function ok200(content) {
 
 // A one-row run that meets one transient provider error (5xx, or a 429 that
 // survives its retry) is not a broken run: no throw, Log row written, row left
-// for the next run. Only failures that would repeat (400, unparseable reply)
-// still trip the all-failed guard.
+// for the next run. Only failures that would repeat (400, unparseable reply,
+// a 200 whose body isn't JSON) still trip the all-failed guard.
 (function () {
   var r = runScenario({ data: singleRowGrid(), respond: function () { return { code: 500, body: 'oops' }; } });
   check('single-row 500: does not throw', r.threw === null);
@@ -483,9 +497,29 @@ function ok200(content) {
   check('single-row 429x2: does not throw', r.threw === null && r.calls === 2);
   eq('single-row 429x2: Log row', r.logRow, [1, 0, 0, 1, 0]);
 })();
+// A 200 whose body isn't JSON is a wrong endpoint, a proxy or a login page,
+// not a blip: it would repeat on every run, so it is a hard error. Deliberately
+// flipped from transient on 2026-10-16 -- a misconfigured endpoint must not
+// fail quietly forever.
 (function () {
-  var r = runScenario({ data: singleRowGrid(), respond: function () { return { code: 200, body: 'not json' }; } });
-  check('single-row garbage 200 body: transient, does not throw', r.threw === null);
+  var r = runScenario({ data: singleRowGrid(), respond: function () { return { code: 200, body: '<html>Sign in</html>' }; } });
+  check('single-row HTML 200 body: hard error, throws naming API_ENDPOINT',
+    r.threw !== null && /API_ENDPOINT/.test(r.threw.message));
+  eq('single-row HTML 200 body: Log row written first', r.logRow, [1, 0, 0, 1, 0]);
+  check('single-row HTML 200 body: row stays new, cause logged',
+    r.data[1][2] === 'new' && logLines.some(function (l) { return l.indexOf('not JSON') !== -1; }));
+})();
+(function () {
+  var r = runScenario({ keywords: '', respond: function () { return { code: 200, body: 'not json' }; } });
+  check('all-HTML-200 run: every row tried, then throws (not treated as an outage)',
+    r.threw !== null && r.calls === 2);
+  eq('all-HTML-200 run: Log row (2 errors)', r.logRow, [2, 0, 0, 2, 0]);
+})();
+(function () {
+  var r = runScenario({ keywords: '', respond: function (n) {
+    return n === 1 ? { code: 503, body: 'down' } : { code: 200, body: 'not json' };
+  } });
+  check('503 then HTML 200, nothing graded: throws', r.threw !== null && /failed/.test(r.threw.message));
 })();
 (function () {
   var r = runScenario({ data: singleRowGrid(), respond: function () { return { code: 400, body: 'model_decommissioned' }; } });
@@ -534,13 +568,31 @@ function ok200(content) {
   var data2 = [H, ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1]];
   var r2 = runScenario({ data: data2, formulas: formulas, respond: function (n, sheets) {
     tick(sheets);
-    if (n === 1) {  // one sort, during the first row's API call
-      var g = sheets[cfg.DATA_SHEET].grid;
-      var tmp = g[1]; g[1] = g[2]; g[2] = tmp;
-    }
+    if (n === 1) sheets[cfg.DATA_SHEET].swapRows(2, 3);  // one sort, during the first row's API call
     return ok200('GRADE: B\nREASONING: Fine.');
   } });
   eq('volatile column + real sort: both rows still deferred', r2.logRow, [2, 0, 0, 0, 2]);
+})();
+
+// Content columns that are themselves formulas (=Src!A2 pulling from another
+// tab). Their values are not compared, but their formula text is, so a plain
+// run grades every row while a sort -- which carries each row's formulas with
+// it -- is still caught instead of putting Alpha's grade on Beta's row.
+(function () {
+  function grid() { return [HEADERS, ['Alpha', 'Alpha is great', 'new', '', ''], ['Beta', 'Beta is meh', 'new', '', '']]; }
+  function fx() { return [[], ['=Src!A2', '=Src!B2'], ['=Src!A3', '=Src!B3']]; }
+  var r = runScenario({ data: grid(), formulas: fx(), respond: function () { return ok200('GRADE: A\nREASONING: Great.'); } });
+  check('formula-backed content: does not throw', r.threw === null);
+  eq('formula-backed content: both rows graded, none deferred', r.logRow, [2, 2, 0, 0, 0]);
+
+  var r2 = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+    if (n === 1) sheets[cfg.DATA_SHEET].swapRows(2, 3);  // one sort, during the first row's API call
+    return ok200(n === 1 ? 'GRADE: A\nREASONING: Alpha is great.' : 'GRADE: F\nREASONING: Beta is meh.');
+  } });
+  check('formula-backed content + sort: does not throw', r2.threw === null);
+  eq('formula-backed content + sort: both rows deferred', r2.logRow, [2, 0, 0, 0, 2]);
+  check('formula-backed content + sort: no grade landed on the wrong row',
+    r2.data[1][3] === '' && r2.data[2][3] === '' && r2.data[1][2] === 'new' && r2.data[2][2] === 'new');
 })();
 
 // --- placeholder sentinel regression guard ---------------------------------
