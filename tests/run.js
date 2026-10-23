@@ -44,6 +44,7 @@ var findRowTitle_ = sandbox.findRowTitle_;
 var normalizeConfig_ = sandbox.normalizeConfig_;
 var buildGradingPrompt_ = sandbox.buildGradingPrompt_;
 var rowMatchesSnapshot_ = sandbox.rowMatchesSnapshot_;
+var findVolatileColumns_ = sandbox.findVolatileColumns_;
 var gradeNewRows = sandbox.gradeNewRows;
 var RUN_LOG_HEADERS = sandbox.RUN_LOG_HEADERS;
 var EXCLUDE_KEYWORDS_PLACEHOLDER = sandbox.EXCLUDE_KEYWORDS_PLACEHOLDER;
@@ -299,6 +300,31 @@ check('formula text does not excuse a width change',
   rowMatchesSnapshot_(['a', 1], ['a', 1, ''], ['', '=X'], ['', '=X', '']) === false);
 check('all-plain formula arrays fall back to value comparison',
   rowMatchesSnapshot_(['a', 1], ['a', 2], ['', ''], ['', '']) === false);
+// skipCols: the spill of a volatile array formula (no formula text of its own)
+var V = [false, true, false];
+check('a formula-less cell in a volatile column may change value',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['a', 2, 'new'], ['', '', ''], null, V) === true);
+check('a plain cell outside the volatile column still breaks the match',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['b', 2, 'new'], ['', '', ''], null, V) === false);
+check('the anchor cell of a volatile column is still compared by formula text',
+  rowMatchesSnapshot_(['a', 1, 'new'], ['a', 1, 'new'], ['', '=ARRAYFORMULA(NOW()-E2:E)', ''], ['', '=ARRAYFORMULA(NOW()-E3:E)', ''], V) === false);
+check('skipCols does not excuse a width change',
+  rowMatchesSnapshot_(['a', 1], ['a', 1, ''], ['', ''], null, [false, true]) === false);
+
+// --- findVolatileColumns_ (per-column volatile detection) -------------------
+eq('no formulas: no volatile columns', findVolatileColumns_([[], []], 3), [false, false, false]);
+eq('anchor-only volatile array formula flags its column',
+  findVolatileColumns_([['', '=ARRAYFORMULA(NOW()-E2:E)', ''], ['', '', '']], 3), [false, true, false]);
+eq('per-row volatile formulas flag their column too',
+  findVolatileColumns_([['', '', '=TODAY()-F2'], ['', '', '=today()-F3']], 3), [false, false, true]);
+eq('a non-volatile formula column is not flagged',
+  findVolatileColumns_([['=Src!A2', '=ARRAYFORMULA(Src!B2:B)'], ['=Src!A3', '']], 2), [false, false]);
+eq('a function whose name merely ends in a volatile name is not flagged',
+  findVolatileColumns_([['=KNOWN(A2)', '=RANDOMIZE(B2)']], 2), [false, false]);
+eq('the anchor row may be below a graded row (whole range is scanned)',
+  findVolatileColumns_([['', ''], ['', '=RANDBETWEEN(1,9)']], 2), [false, true]);
+eq('width is honoured when the formula rows are narrower',
+  findVolatileColumns_([['=RAND()']], 3), [true, false, false]);
 
 // --- gradeNewRows end to end (stubbed Sheets / fetch / properties / lock) ----
 // Minimal in-memory Sheet: enough of getRange/getValues/getFormulas/setValues/
@@ -546,8 +572,8 @@ function ok200(content) {
 })();
 
 // A volatile formula column (=NOW(), =TODAY()-scraped_at) recalculates on every
-// write. Its cells are excluded from the moved-row comparison, so every row
-// still grades -- while a real sort is still caught.
+// write. Its cells are compared by formula text, not value, so every row still
+// grades -- while a real sort, which carries the formulas along, is still caught.
 (function () {
   var H = HEADERS.concat(['age']);
   var data = [H, ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1], ['Three', 'c', 'new', '', '', 1]];
@@ -593,6 +619,40 @@ function ok200(content) {
   eq('formula-backed content + sort: both rows deferred', r2.logRow, [2, 0, 0, 0, 2]);
   check('formula-backed content + sort: no grade landed on the wrong row',
     r2.data[1][3] === '' && r2.data[2][3] === '' && r2.data[1][2] === 'new' && r2.data[2][2] === 'new');
+})();
+
+// A single volatile ARRAYFORMULA in the top cell fills the whole column: only
+// row 2 carries formula text, the spilled cells below read back as '' and
+// change value on every write. Without the per-column rule every row after the
+// first paid for its API call and was then deferred (2026-10-23 audit).
+(function () {
+  var H = HEADERS.concat(['age']);
+  function grid() {
+    return [H, ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1], ['Three', 'c', 'new', '', '', 1]];
+  }
+  var ANCHOR = '=ARRAYFORMULA(NOW()-E2:E)';
+  function fx() { return [[], ['', '', '', '', '', ANCHOR], [], []]; }
+  function tick(sheets) {  // recalculation: every spilled cell changes on every call
+    var g = sheets[cfg.DATA_SHEET].grid;
+    for (var i = 1; i < g.length; i++) g[i][5] += 1;
+  }
+  var r = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+    tick(sheets);
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  check('volatile ARRAYFORMULA spill: does not throw', r.threw === null);
+  eq('volatile ARRAYFORMULA spill: all rows graded, none deferred', r.logRow, [3, 3, 0, 0, 0]);
+  check('volatile ARRAYFORMULA spill: grades landed', r.data[1][3] === 'B' && r.data[2][3] === 'B' && r.data[3][3] === 'B');
+
+  // Same sheet, rows 3 and 4 swapped mid-run: the plain columns still catch it.
+  var r2 = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+    tick(sheets);
+    if (n === 1) sheets[cfg.DATA_SHEET].swapRows(3, 4);  // one sort, during the first row's API call
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  eq('volatile ARRAYFORMULA spill + real sort: row 2 graded, the swapped pair deferred', r2.logRow, [3, 1, 0, 0, 2]);
+  check('volatile ARRAYFORMULA spill + real sort: no grade on the swapped rows',
+    r2.data[2][3] === '' && r2.data[3][3] === '');
 })();
 
 // --- placeholder sentinel regression guard ---------------------------------

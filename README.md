@@ -96,8 +96,13 @@ A few details worth knowing:
   (`=NOW()`, `=TODAY()-scraped_at`, `=RAND()`) that recalculates on every write
   doesn't make every row look moved, while a sort — which moves each row's
   formulas along with it — is still caught even when every content column is a
-  formula. What this can't see is a change in a formula's *inputs* (an edit on
-  the tab a `=VLOOKUP` reads from) while a run is in progress.
+  formula. A column filled by a single array formula (`=ARRAYFORMULA(NOW()-E2:E)`
+  in its top cell) holds formula text in that top cell only, so when the formula
+  names a volatile function (`VOLATILE_FUNCTIONS`, default `NOW`, `TODAY`,
+  `RAND`, `RANDBETWEEN`, `RANDARRAY`) the cells it spills into aren't compared
+  at all; the row's plain columns still catch a sort. What this can't see is a
+  change in a formula's *inputs* (an edit on the tab a `=VLOOKUP` reads from)
+  while a run is in progress.
 
 ## Setup
 
@@ -310,6 +315,7 @@ header, or status is matched case-insensitively.
 | `TITLE_COLUMNS` | `['title', 'name']` | Which column counts as a row's title for `title:` exclude keywords (first non-empty wins). |
 | `CRITERIA_KEY_HEADER` / `CRITERIA_VALUE_HEADER` | `field` / `value` | Criteria sheet column headers. |
 | `SKIP_COLUMNS_IN_PROMPT` | `status`, `grade`, `reasoning`, `id`, `scraped_at`, `graded_at` | Columns never sent to the LLM or checked by exclude keywords. Add anything you don't want leaving the sheet. |
+| `VOLATILE_FUNCTIONS` | `NOW`, `TODAY`, `RAND`, `RANDBETWEEN`, `RANDARRAY` | Spreadsheet functions that recalculate on every edit. A column whose formula names one of them (an `=ARRAYFORMULA(NOW()-…)` filling the column from its top cell) has its formula-less cells left out of the moved-row check, so each grade written doesn't make the rows below it look moved. |
 | `MAX_FIELD_CHARS` | `600` | Per-field truncation in the prompt. Raise it if your rows have important long-form content. |
 | `ENABLE_RUN_LOG` | `true` | Append a per-run summary to the `Log` sheet. |
 
@@ -359,8 +365,9 @@ stubbed, so the assertions run against the actual source. It also runs
 `gradeNewRows` end to end against in-memory stand-ins for the Sheets and fetch
 services, covering the happy path, a rejected key, a retired model, a
 transient provider blip, a non-JSON `200`, a row that moves mid-run, a volatile
-formula column, and formula-backed content columns sorted mid-run. Real Sheets
-and network behavior still only run bound to a real spreadsheet.
+formula column, formula-backed content columns sorted mid-run, and a volatile
+`ARRAYFORMULA` column filled from its top cell (with and without a sort). Real
+Sheets and network behavior still only run bound to a real spreadsheet.
 
 ## License
 

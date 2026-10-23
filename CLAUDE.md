@@ -52,7 +52,8 @@ real Apps Script services only run bound to a real sheet — but the Node test h
 (`npm test` / `tests/run.js`) exercises the real `Grader.js` source: the pure helpers
 directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/fetch
 (happy path, rejected key, retired model, transient blip, non-JSON 200, row moved mid-run,
-volatile formula column, formula-backed rows sorted mid-run). Run it after touching
+volatile formula column, formula-backed rows sorted mid-run, volatile `ARRAYFORMULA`
+spill column with and without a sort). Run it after touching
 anything; add a scenario there when touching the loop or a failure path.
 
 ## Architecture (one file, top-down in `Grader.js`)
@@ -73,13 +74,15 @@ anything; add a scenario there when touching the loop or a failure path.
   to leave that error out of the all-failed guard.
   Before either write it calls `rowStillInPlace_`, which re-reads the row and compares it
   to the `_snapshot` taken by `getUngradedRows_`, comparing cells that held a formula by
-  their `_formulas` text instead of their value; a mismatch skips the write (outcome
-  `skipped`) so a sort mid-run can't put a grade on the wrong row.
+  their `_formulas` text instead of their value, and not comparing formula-less cells in
+  a `_volatileCols` column (the spill of a volatile array formula, see
+  `findVolatileColumns_`); a mismatch skips the write (outcome `skipped`) so a sort
+  mid-run can't put a grade on the wrong row.
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
   `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
-  `normalizeConfig_` (runs once at load), `getUngradedRows_`, `rowStillInPlace_` /
-  `rowMatchesSnapshot_`, `findRowTitle_` /
+  `normalizeConfig_` (runs once at load), `getUngradedRows_` / `findVolatileColumns_`,
+  `rowStillInPlace_` / `rowMatchesSnapshot_`, `findRowTitle_` /
   `hasTitleColumn_` / `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`,
   `buildGradingPrompt_`, `parseGradeResponse_`, `updateRowGrade_`,
   `buildRunLogRow_` / `appendRunLog_`
@@ -95,7 +98,8 @@ anything; add a scenario there when touching the loop or a failure path.
   `resolveColumns_`, the Criteria sheet via `parseCriteriaValues_` (which falls back to
   the first two columns only when the `field`/`value` headers are missing).
 - **Private helpers end in `_`** (Apps Script hides them from the Run menu).
-- **Row-object keys starting with `_` are internal** (`_row`, `_snapshot`, `_formulas`). Every
+- **Row-object keys starting with `_` are internal** (`_row`, `_snapshot`, `_formulas`,
+  `_volatileCols`). Every
   iterator over a row skips them, and a Data-sheet header starting with `_` is ignored
   with a warning.
 - **The rubric lives in the sheet, not the code.** That keeps the user's prompt out of
@@ -168,7 +172,11 @@ anything; add a scenario there when touching the loop or a failure path.
 - A row that moves or changes mid-run is skipped and deferred, not graded. Legit mid-run
   edits to a row's *plain-value* cells therefore push that row to the next run (one extra
   API call). Formula cells are compared by formula text, not value, so a change in a
-  formula's *inputs* (an edit on the tab a `=VLOOKUP` reads from) is not caught.
+  formula's *inputs* (an edit on the tab a `=VLOOKUP` reads from) is not caught. The
+  formula-less cells of a column whose formula names a `VOLATILE_FUNCTIONS` entry (an
+  `=ARRAYFORMULA(NOW()-…)` spill) are not compared at all, so a sort is only caught there
+  through the row's other columns; a sheet whose *every* content column is such a spill
+  has no moved-row protection.
 - A provider outage that fails every row in a run no longer emails the owner (transient
   errors don't trip the all-failed guard). It shows as `errors` in the Log sheet instead.
 
@@ -183,7 +191,13 @@ anything; add a scenario there when touching the loop or a failure path.
   `_snapshot` (same width, read from the same range), and compare formula cells by text,
   never by value and never by skipping them — a volatile formula column otherwise defers
   every row after paying for its API call, and skipping them outright put grades on the
-  wrong rows when every content column was a formula (2026-10-16 audit).
+  wrong rows when every content column was a formula (2026-10-16 audit). The one
+  skip that is allowed is per *column*, not per cell: formula-less cells in a column
+  that `findVolatileColumns_` flagged (a volatile `ARRAYFORMULA` holds its text in the
+  top cell only, and its spill changes value on every write) — otherwise one such
+  column deferred every row after the first, each after paying for its call
+  (2026-10-23 audit). Keep that detection reading the *whole* range, not just the
+  gradable rows: the anchor sits in row 2, which is usually already graded.
 - Adding a provider? Usually only `API_ENDPOINT` / `API_MODEL` / key need to change —
   plus `REASONING_EFFORT`, which is only sent when non-empty; blank it for providers
   that reject the parameter. One exception: `MAX_OUTPUT_TOKENS` goes out as
@@ -199,6 +213,8 @@ anything; add a scenario there when touching the loop or a failure path.
   match a keyword that starts or ends with punctuation (`c++`, `.net`, `c#`).
 - Adding a config value that's compared to a sheet header/cell? Add it to
   `normalizeConfig_` so a capitalized entry can't silently fail to match.
+  (`VOLATILE_FUNCTIONS` is the exception: it is matched against formula text with a
+  case-insensitive regex built in `findVolatileColumns_`, so it needs no normalizing.)
 - `title:` keywords match only `findRowTitle_` (the `TITLE_COLUMNS`). Keep
   `guessRowTitle_`'s fallback-to-any-column behavior out of matching — it's for logs.
 - Changing `updateRowGrade_`? It takes a `cols` object (`{ gradeCol, reasoningCol,

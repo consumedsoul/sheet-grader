@@ -90,6 +90,14 @@ var GRADER_CONFIG = {
   STATUSES_TO_GRADE: ['new', 'regrade'],
   STATUS_GRADED: 'graded',
 
+  // Spreadsheet functions that recalculate on every edit. A Data column whose
+  // formula names one of these (=ARRAYFORMULA(NOW()-E2:E) in its top cell, say)
+  // fills the cells below with values that change on every grade written, and
+  // those spilled cells carry no formula text of their own. The moved-row guard
+  // therefore does not value-compare the formula-less cells of such a column;
+  // the row's plain columns still catch a sort. Matched case-insensitively.
+  VOLATILE_FUNCTIONS: ['NOW', 'TODAY', 'RAND', 'RANDBETWEEN', 'RANDARRAY'],
+
   // Columns to skip when building the prompt (already metadata, not content
   // worth grading). Matched case-insensitively (see normalizeConfig_).
   SKIP_COLUMNS_IN_PROMPT: ['status', 'grade', 'reasoning', 'id', 'scraped_at', 'graded_at'],
@@ -619,7 +627,8 @@ function isGradableStatus_(rawStatus) {
  * values read here, which rowStillInPlace_ re-checks before any write) and
  * _formulas (the formula text of each cell, '' for a plain value, so the
  * re-check can compare formula cells by text instead of by recalculated
- * value). Every iterator over a row skips "_"-prefixed keys.
+ * value) and _volatileCols (see findVolatileColumns_). Every iterator over a
+ * row skips "_"-prefixed keys.
  */
 function getUngradedRows_(sheet, headers, colMap) {
   var lastRow = sheet.getLastRow();
@@ -633,8 +642,10 @@ function getUngradedRows_(sheet, headers, colMap) {
   // the first write, so rowStillInPlace_ compares their formula text instead:
   // a recalculation leaves the text alone, while a sort carries each row's
   // formulas (=Src!A2 vs =Src!A3) along with it. One read for the whole range;
-  // '' means the cell holds a plain value.
+  // '' means the cell holds a plain value -- or sits under an array formula
+  // whose text lives only in its top cell, which findVolatileColumns_ handles.
   var formulas = range.getFormulas();
+  var volatileCols = findVolatileColumns_(formulas, headers.length);
   var statusIdx = colMap[GRADER_CONFIG.STATUS_COLUMN] - 1;
   var rows = [];
 
@@ -649,10 +660,43 @@ function getUngradedRows_(sheet, headers, colMap) {
       row._row = i + 2;
       row._snapshot = data[i];
       row._formulas = rowFormulas;
+      row._volatileCols = volatileCols;
       rows.push(row);
     }
   }
   return rows;
+}
+
+/**
+ * One boolean per column: true when any formula in that column (over the
+ * whole read range, not just the gradable rows) names a function in
+ * GRADER_CONFIG.VOLATILE_FUNCTIONS. An array formula such as
+ * =ARRAYFORMULA(NOW()-E2:E) holds its text in the top cell only; the cells it
+ * spills into read back from getFormulas() as '' yet change value on every
+ * grade written, so comparing them by value would defer every row after the
+ * first (2026-10-23 audit). rowMatchesSnapshot_ skips the value comparison of
+ * formula-less cells in these columns; cells that do carry formula text are
+ * still compared by text. Case-insensitive; a volatile function spelled inside
+ * a string literal counts too, which only costs that column its value check.
+ */
+function findVolatileColumns_(formulas, width) {
+  var names = GRADER_CONFIG.VOLATILE_FUNCTIONS || [];
+  var flags = [];
+  for (var c = 0; c < width; c++) flags.push(false);
+  if (!names.length || !formulas) return flags;
+  var parts = [];
+  for (var n = 0; n < names.length; n++) {
+    var name = (names[n] === null || names[n] === undefined ? '' : names[n]).toString().trim();
+    if (name) parts.push(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  }
+  if (!parts.length) return flags;
+  var volatile = new RegExp('(^|[^A-Z0-9_.])(' + parts.join('|') + ')\\s*\\(', 'i');
+  for (var r = 0; r < formulas.length; r++) {
+    for (var j = 0; j < width; j++) {
+      if (!flags[j] && formulas[r] && formulas[r][j] && volatile.test(String(formulas[r][j]))) flags[j] = true;
+    }
+  }
+  return flags;
 }
 
 /**
@@ -665,6 +709,8 @@ function getUngradedRows_(sheet, headers, colMap) {
  * value (see getUngradedRows_): a volatile column must not make every row look
  * moved, but a row whose formulas moved with it must. The formulas are only
  * re-read when the snapshot has a formula cell, so a plain sheet pays one read.
+ * Formula-less cells in a column flagged by findVolatileColumns_ (the spill of
+ * a volatile array formula) are not value-compared at all.
  */
 function rowStillInPlace_(sheet, row) {
   var range = sheet.getRange(row._row, 1, 1, row._snapshot.length);
@@ -674,7 +720,7 @@ function rowStillInPlace_(sheet, row) {
   for (var i = 0; i < snapFormulas.length; i++) {
     if (snapFormulas[i]) { currentFormulas = range.getFormulas()[0]; break; }
   }
-  return rowMatchesSnapshot_(row._snapshot, current, snapFormulas, currentFormulas);
+  return rowMatchesSnapshot_(row._snapshot, current, snapFormulas, currentFormulas, row._volatileCols);
 }
 
 /**
@@ -684,15 +730,19 @@ function rowStillInPlace_(sheet, row) {
  * ('' for a plain value). A cell that held a formula at snapshot time matches
  * on formula text only: its recalculated value is free to change, but it must
  * still hold the same formula (a moved row brings its own along, and an
- * overwritten formula reads back as '').
+ * overwritten formula reads back as ''). `skipCols` (optional) is a parallel
+ * array of booleans from findVolatileColumns_: a cell with no formula text in
+ * a true column is the spill of a volatile array formula and is not compared,
+ * since its value changes on every write. The width check still applies.
  */
-function rowMatchesSnapshot_(snapshot, current, snapFormulas, curFormulas) {
+function rowMatchesSnapshot_(snapshot, current, snapFormulas, curFormulas, skipCols) {
   if (!snapshot || !current || snapshot.length !== current.length) return false;
   for (var i = 0; i < snapshot.length; i++) {
     if (snapFormulas && snapFormulas[i]) {
       if (!curFormulas || String(snapFormulas[i]) !== String(curFormulas[i])) return false;
       continue;
     }
+    if (skipCols && skipCols[i]) continue;
     if (String(snapshot[i]) !== String(current[i])) return false;
   }
   return true;
