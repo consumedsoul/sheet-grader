@@ -73,6 +73,14 @@ var GRADER_CONFIG = {
   // Set false to disable. The Log sheet is created on first write.
   ENABLE_RUN_LOG: true,
 
+  // When more than this share of a run's rows are deferred because they moved
+  // or changed mid-run, the run logs a WARNING naming the columns that differed
+  // and writes it to the Log sheet's notes column. One sort or edit during a
+  // run is normal; the same column named run after run means it changes on its
+  // own (a formula recalculating through a helper cell, which VOLATILE_FUNCTIONS
+  // can't see by name). 0.5 = more than half. Set it above 1 to disable.
+  MOVED_ROW_WARN_RATIO: 0.5,
+
   // Required columns in the Data sheet
   STATUS_COLUMN: 'status',
   GRADE_COLUMN: 'grade',
@@ -289,6 +297,12 @@ function gradeNewRows() {
     Logger.log('Found ' + rows.length + ' ungraded rows');
 
     var stats = { total: rows.length, graded: 0, rejected: 0, errors: 0, skipped: 0 };
+    // Rows deferred because they moved or changed mid-run (a subset of
+    // stats.skipped, which the timer budget and a fatal stop also feed), and
+    // how often each column was what differed -- keyed by 0-based column index,
+    // -1 when the row's width changed. Fed to buildMovedRowWarning_ after the loop.
+    var movedRows = 0;
+    var changedColCounts = {};
     // Set when a row fails in a way no later row can recover from (rejected
     // key, unknown model). The loop stops, the Log row is still written so the
     // failure is visible in the sheet, and then the run throws so Apps Script
@@ -317,6 +331,13 @@ function gradeNewRows() {
       var result = gradeOneRow_(sheet, rows[i], cols, criteriaText, excludeKeywords, apiKey);
       stats[result.outcome]++;
       if (result.outcome === 'errors' && !result.transient) hardErrors++;
+      if (result.outcome === 'skipped') {
+        movedRows++;
+        var changedCols = result.changedCols === null ? [-1] : (result.changedCols || []);
+        for (var c = 0; c < changedCols.length; c++) {
+          changedColCounts[changedCols[c]] = (changedColCounts[changedCols[c]] || 0) + 1;
+        }
+      }
       pauseMs = result.madeApiCall ? GRADER_CONFIG.API_DELAY_MS : 0;
       if (result.fatal) {
         // Every remaining row would fail the same way; stop burning calls.
@@ -332,11 +353,18 @@ function gradeNewRows() {
     Logger.log('=== Done: ' + stats.graded + ' graded, ' + stats.rejected + ' auto-rejected, ' +
       stats.errors + ' errors, ' + stats.skipped + ' deferred in ' + totalElapsedSec.toFixed(1) + 's ===');
 
+    // A run that deferred most of its rows as "moved" is either a sort that
+    // happened mid-run (fine, once) or a column that changes on its own and
+    // will defer the same rows every run, each after paying for its API call.
+    // Name the columns so the Log sheet explains itself either way.
+    var movedWarning = buildMovedRowWarning_(movedRows, stats.total, changedColCounts, headers);
+    if (movedWarning) Logger.log('WARNING: ' + movedWarning);
+
     // Best-effort run summary. Grades are already persisted per-row, so a Log
     // sheet hiccup must not turn a successful run into a FATAL ERROR -- swallow it.
     if (GRADER_CONFIG.ENABLE_RUN_LOG) {
       try {
-        appendRunLog_(stats, startTime, totalElapsedSec);
+        appendRunLog_(stats, startTime, totalElapsedSec, movedWarning);
       } catch (logErr) {
         Logger.log('WARNING: failed to write run log: ' + logErr.message);
       }
@@ -409,24 +437,30 @@ function resolveColumns_(colMap, dupKeys) {
  * Grades a single row and writes the result back. Runs Stage 1 (cheap exclude-
  * keyword reject, no API call) then Stage 2 (LLM) only if the row survives.
  *
- * Returns { outcome, madeApiCall, fatal, transient } where outcome is one of
- * 'graded', 'rejected', 'skipped' or 'errors' (keyed to match the stats object),
- * madeApiCall tells the caller whether to pace against the rate limit, `fatal`
- * is an error message when the run should stop, and `transient` is true when
- * an 'errors' outcome was a provider blip (429/5xx) rather than a failure that
- * will repeat -- the caller leaves those out of the all-calls-failed guard.
+ * Returns { outcome, madeApiCall, fatal, transient, changedCols } where outcome
+ * is one of 'graded', 'rejected', 'skipped' or 'errors' (keyed to match the
+ * stats object), madeApiCall tells the caller whether to pace against the rate
+ * limit, `fatal` is an error message when the run should stop, `transient` is
+ * true when an 'errors' outcome was a provider blip (429/5xx) rather than a
+ * failure that will repeat -- the caller leaves those out of the
+ * all-calls-failed guard -- and `changedCols`, on a 'skipped' outcome, is what
+ * findRowChanges_ reported: the 0-based indexes of the columns that differed,
+ * or null when the row's width changed. The caller tallies those for the
+ * most-rows-deferred warning.
  */
 function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
   var titleHint = guessRowTitle_(row);
+  var drift = null;
 
   // Stage 1: cheap exclude-keyword filter. No API call.
   var excludeMatch = checkExcludeKeywords_(row, excludeKeywords);
   if (excludeMatch) {
     var reason = 'Auto-rejected: matched exclude keyword "' + excludeMatch + '"';
     var lowest = GRADER_CONFIG.VALID_GRADES[GRADER_CONFIG.VALID_GRADES.length - 1];
-    if (!rowStillInPlace_(sheet, row)) {
+    drift = findRowChanges_(sheet, row);
+    if (drift === null || drift.length) {
       Logger.log('  [SKIP] Row ' + row._row + ' (' + titleHint + ') moved or changed since the run started -- not writing; it will be graded next run.');
-      return { outcome: 'skipped', madeApiCall: false };
+      return { outcome: 'skipped', madeApiCall: false, changedCols: drift };
     }
     updateRowGrade_(sheet, row._row, cols, lowest, reason);
     Logger.log('  [' + lowest + '] ' + titleHint + ' -- ' + reason);
@@ -449,9 +483,10 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
       return { outcome: 'errors', madeApiCall: true };
     }
 
-    if (!rowStillInPlace_(sheet, row)) {
+    drift = findRowChanges_(sheet, row);
+    if (drift === null || drift.length) {
       Logger.log('  [SKIP] Row ' + row._row + ' (' + titleHint + ') moved or changed since the run started -- not writing; it will be graded next run.');
-      return { outcome: 'skipped', madeApiCall: true };
+      return { outcome: 'skipped', madeApiCall: true, changedCols: drift };
     }
     updateRowGrade_(sheet, row._row, cols, parsed.grade, parsed.reasoning);
     Logger.log('  [' + parsed.grade + '] ' + titleHint);
@@ -624,7 +659,7 @@ function isGradableStatus_(rawStatus) {
 /**
  * Returns row objects whose status is gradable (see isGradableStatus_), each
  * tagged with _row (its 1-based sheet row number), _snapshot (the raw cell
- * values read here, which rowStillInPlace_ re-checks before any write) and
+ * values read here, which findRowChanges_ re-checks before any write) and
  * _formulas (the formula text of each cell, '' for a plain value, so the
  * re-check can compare formula cells by text instead of by recalculated
  * value) and _volatileCols (see findVolatileColumns_). Every iterator over a
@@ -639,7 +674,7 @@ function getUngradedRows_(sheet, headers, colMap) {
   // Formula cells recalculate on their own -- =NOW(), =TODAY()-scraped_at,
   // =RAND() -- and every grade written is a sheet edit that recalculates them.
   // Comparing their values would make almost every row look "changed" after
-  // the first write, so rowStillInPlace_ compares their formula text instead:
+  // the first write, so findRowChanges_ compares their formula text instead:
   // a recalculation leaves the text alone, while a sort carries each row's
   // formulas (=Src!A2 vs =Src!A3) along with it. One read for the whole range;
   // '' means the cell holds a plain value -- or sits under an array formula
@@ -680,7 +715,7 @@ function getUngradedRows_(sheet, headers, colMap) {
  * cells it spills into read back from getFormulas() as '' yet change value on
  * every grade written, so comparing them by value would defer every row after
  * the first (2026-10-23 audit), or every row at all when the anchor is the
- * header (2026-10-30 audit). rowMatchesSnapshot_ skips the value comparison of
+ * header (2026-10-30 audit). findChangedColumns_ skips the value comparison of
  * formula-less cells in these columns; cells that do carry formula text are
  * still compared by text. Case-insensitive; a volatile function spelled inside
  * a string literal counts too, which only costs that column its value check.
@@ -706,8 +741,10 @@ function findVolatileColumns_(formulas, width) {
 }
 
 /**
- * Re-reads a row right before its grade is written and reports whether it
- * still holds the values captured at the start of the run. A backlog run lasts
+ * Re-reads a row right before its grade is written and reports which columns
+ * no longer hold the values captured at the start of the run: an array of
+ * 0-based column indexes ([] means the row is still in place), or null when the
+ * row's width changed (a column was inserted or removed). A backlog run lasts
  * up to TIMER_BUDGET_SEC, and sorting the Data tab (or inserting rows above)
  * in that window renumbers every row -- without this check the grade would
  * land on whichever row now sits at that number. Costs one read per write.
@@ -718,7 +755,7 @@ function findVolatileColumns_(formulas, width) {
  * Formula-less cells in a column flagged by findVolatileColumns_ (the spill of
  * a volatile array formula) are not value-compared at all.
  */
-function rowStillInPlace_(sheet, row) {
+function findRowChanges_(sheet, row) {
   var range = sheet.getRange(row._row, 1, 1, row._snapshot.length);
   var current = range.getValues()[0];
   var snapFormulas = row._formulas || [];
@@ -726,12 +763,14 @@ function rowStillInPlace_(sheet, row) {
   for (var i = 0; i < snapFormulas.length; i++) {
     if (snapFormulas[i]) { currentFormulas = range.getFormulas()[0]; break; }
   }
-  return rowMatchesSnapshot_(row._snapshot, current, snapFormulas, currentFormulas, row._volatileCols);
+  return findChangedColumns_(row._snapshot, current, snapFormulas, currentFormulas, row._volatileCols);
 }
 
 /**
- * Pure cell-by-cell comparison behind rowStillInPlace_. Values are compared as
- * strings so dates and numbers read back from the sheet compare by content.
+ * Pure cell-by-cell comparison behind findRowChanges_: returns the 0-based
+ * indexes of the cells that differ ([] when none do), or null when the rows
+ * can't be compared at all (missing, or a different width). Values are compared
+ * as strings so dates and numbers read back from the sheet compare by content.
  * `snapFormulas` / `curFormulas` (optional) are parallel arrays of formula text
  * ('' for a plain value). A cell that held a formula at snapshot time matches
  * on formula text only: its recalculated value is free to change, but it must
@@ -741,17 +780,53 @@ function rowStillInPlace_(sheet, row) {
  * a true column is the spill of a volatile array formula and is not compared,
  * since its value changes on every write. The width check still applies.
  */
-function rowMatchesSnapshot_(snapshot, current, snapFormulas, curFormulas, skipCols) {
-  if (!snapshot || !current || snapshot.length !== current.length) return false;
+function findChangedColumns_(snapshot, current, snapFormulas, curFormulas, skipCols) {
+  if (!snapshot || !current || snapshot.length !== current.length) return null;
+  var changed = [];
   for (var i = 0; i < snapshot.length; i++) {
     if (snapFormulas && snapFormulas[i]) {
-      if (!curFormulas || String(snapFormulas[i]) !== String(curFormulas[i])) return false;
+      if (!curFormulas || String(snapFormulas[i]) !== String(curFormulas[i])) changed.push(i);
       continue;
     }
     if (skipCols && skipCols[i]) continue;
-    if (String(snapshot[i]) !== String(current[i])) return false;
+    if (String(snapshot[i]) !== String(current[i])) changed.push(i);
   }
-  return true;
+  return changed;
+}
+
+/** True when findChangedColumns_ finds the row comparable and unchanged. */
+function rowMatchesSnapshot_(snapshot, current, snapFormulas, curFormulas, skipCols) {
+  var changed = findChangedColumns_(snapshot, current, snapFormulas, curFormulas, skipCols);
+  return changed !== null && changed.length === 0;
+}
+
+/**
+ * The most-rows-deferred warning, or '' when there is nothing to warn about:
+ * `moved` rows out of `total` were skipped as moved/changed, and that is more
+ * than GRADER_CONFIG.MOVED_ROW_WARN_RATIO of the run. `colCounts` maps a
+ * 0-based column index (-1 for "the row's width changed") to how many of those
+ * rows differed there; the columns are named from `headers`, most frequent
+ * first. Pure, so the harness can pin the wording the Log sheet shows.
+ */
+function buildMovedRowWarning_(moved, total, colCounts, headers) {
+  var ratio = Number(GRADER_CONFIG.MOVED_ROW_WARN_RATIO);
+  if (!moved || !total || isNaN(ratio) || !(moved > total * ratio)) return '';
+  var keys = [];
+  for (var k in colCounts) if (colCounts.hasOwnProperty(k)) keys.push(k);
+  keys.sort(function (a, b) { return (colCounts[b] - colCounts[a]) || (Number(a) - Number(b)); });
+  var parts = [];
+  for (var i = 0; i < keys.length; i++) {
+    var idx = Number(keys[i]);
+    var header = idx >= 0 && headers && headers[idx] !== undefined && headers[idx] !== null
+      ? headers[idx].toString().trim() : '';
+    var label = idx < 0 ? 'row width' : (header || ('column ' + (idx + 1)));
+    parts.push(label + ' (' + colCounts[keys[i]] + ')');
+  }
+  return moved + ' of ' + total + ' rows were deferred because they moved or changed mid-run. ' +
+    'Columns that differed: ' + (parts.length ? parts.join(', ') : 'none recorded') + '. ' +
+    'One sort or edit during a run is normal. If the same column is named run after run, ' +
+    'it changes on its own (a formula recalculating through a helper cell?): put the ' +
+    'volatile function in that column\'s own formula, or add it to VOLATILE_FUNCTIONS.';
 }
 
 /**
@@ -1084,15 +1159,17 @@ function updateRowGrade_(sheet, row, cols, grade, reasoning) {
 // ============================================================================
 
 // Column order for the Log sheet. 'deferred' mirrors stats.skipped (rows that
-// keep their existing status when a run hits the timer budget and resume next time).
-var RUN_LOG_HEADERS = ['run_at', 'total', 'graded', 'rejected', 'errors', 'deferred', 'elapsed_sec'];
+// keep their existing status when a run hits the timer budget, stops on a fatal
+// error, or finds a row moved, and resume next time). 'notes' carries the
+// most-rows-deferred warning (buildMovedRowWarning_) and is otherwise blank.
+var RUN_LOG_HEADERS = ['run_at', 'total', 'graded', 'rejected', 'errors', 'deferred', 'elapsed_sec', 'notes'];
 
 /**
  * Shapes a stats object into a Log-sheet row in RUN_LOG_HEADERS order. Pure
  * (no sheet I/O) so it can be unit-tested. runAt is a pre-formatted string;
- * elapsedSec is rounded to one decimal.
+ * elapsedSec is rounded to one decimal; notes (optional) is free text.
  */
-function buildRunLogRow_(stats, runAt, elapsedSec) {
+function buildRunLogRow_(stats, runAt, elapsedSec, notes) {
   return [
     runAt,
     stats.total,
@@ -1100,7 +1177,8 @@ function buildRunLogRow_(stats, runAt, elapsedSec) {
     stats.rejected,
     stats.errors,
     stats.skipped,
-    Math.round(elapsedSec * 10) / 10
+    Math.round(elapsedSec * 10) / 10,
+    notes || ''
   ];
 }
 
@@ -1109,7 +1187,7 @@ function buildRunLogRow_(stats, runAt, elapsedSec) {
  * header) on first use. Append-only -- it never touches the Data sheet, so it
  * can't affect timer-budget resumability or per-row crash safety.
  */
-function appendRunLog_(stats, startTime, elapsedSec) {
+function appendRunLog_(stats, startTime, elapsedSec, notes) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(GRADER_CONFIG.LOG_SHEET);
   if (!sheet) {
@@ -1117,6 +1195,10 @@ function appendRunLog_(stats, startTime, elapsedSec) {
     sheet.getRange(1, 1, 1, RUN_LOG_HEADERS.length).setValues([RUN_LOG_HEADERS]);
     sheet.getRange(1, 1, 1, RUN_LOG_HEADERS.length).setFontWeight('bold');
     sheet.setFrozenRows(1);
+  } else if (sheet.getLastColumn() < RUN_LOG_HEADERS.length) {
+    // A Log sheet created before a column was added (notes, 2026-10-30):
+    // relabel the header row so the new column isn't a nameless extra.
+    sheet.getRange(1, 1, 1, RUN_LOG_HEADERS.length).setValues([RUN_LOG_HEADERS]);
   }
-  sheet.appendRow(buildRunLogRow_(stats, startTime.toISOString(), elapsedSec));
+  sheet.appendRow(buildRunLogRow_(stats, startTime.toISOString(), elapsedSec, notes));
 }

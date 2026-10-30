@@ -45,6 +45,8 @@ var normalizeConfig_ = sandbox.normalizeConfig_;
 var buildGradingPrompt_ = sandbox.buildGradingPrompt_;
 var rowMatchesSnapshot_ = sandbox.rowMatchesSnapshot_;
 var findVolatileColumns_ = sandbox.findVolatileColumns_;
+var findChangedColumns_ = sandbox.findChangedColumns_;
+var buildMovedRowWarning_ = sandbox.buildMovedRowWarning_;
 var gradeNewRows = sandbox.gradeNewRows;
 var RUN_LOG_HEADERS = sandbox.RUN_LOG_HEADERS;
 var EXCLUDE_KEYWORDS_PLACEHOLDER = sandbox.EXCLUDE_KEYWORDS_PLACEHOLDER;
@@ -270,10 +272,12 @@ eq('duplicate of a non-required column does not hard-fail',
   { gradeCol: 2, reasoningCol: 3, statusCol: 1 });
 
 // --- buildRunLogRow_ (run-summary row shaping) -----------------------------
-eq('run-log row matches header order + rounds elapsed',
+eq('run-log row matches header order + rounds elapsed, blank notes by default',
   buildRunLogRow_({ total: 10, graded: 7, rejected: 2, errors: 1, skipped: 0 },
     '2026-06-18T00:00:00.000Z', 12.34),
-  ['2026-06-18T00:00:00.000Z', 10, 7, 2, 1, 0, 12.3]);
+  ['2026-06-18T00:00:00.000Z', 10, 7, 2, 1, 0, 12.3, '']);
+eq('run-log row carries notes in the last column',
+  buildRunLogRow_({ total: 1, graded: 0, rejected: 0, errors: 0, skipped: 1 }, 'x', 0, 'warned')[7], 'warned');
 eq('run-log row width equals header width',
   buildRunLogRow_({ total: 0, graded: 0, rejected: 0, errors: 0, skipped: 0 }, 'x', 0).length,
   RUN_LOG_HEADERS.length);
@@ -310,6 +314,33 @@ check('the anchor cell of a volatile column is still compared by formula text',
   rowMatchesSnapshot_(['a', 1, 'new'], ['a', 1, 'new'], ['', '=ARRAYFORMULA(NOW()-E2:E)', ''], ['', '=ARRAYFORMULA(NOW()-E3:E)', ''], V) === false);
 check('skipCols does not excuse a width change',
   rowMatchesSnapshot_(['a', 1], ['a', 1, ''], ['', ''], null, [false, true]) === false);
+
+// --- findChangedColumns_ (which columns differ; feeds the deferral warning) --
+eq('unchanged row: no changed columns', findChangedColumns_(['a', 1, 'new'], ['a', 1, 'new']), []);
+eq('changed cells are reported by index', findChangedColumns_(['a', 1, 'new'], ['b', 1, 'graded']), [0, 2]);
+check('a different width is null, not a list', findChangedColumns_(['a'], ['a', '']) === null);
+check('a missing current row is null', findChangedColumns_(['a'], undefined) === null);
+eq('a formula cell differs by text, not value; a volatile spill cell never does',
+  findChangedColumns_(['a', 1, 5], ['a', 2, 9], ['', '=X', ''], ['', '=Y', ''], [false, false, true]), [1]);
+
+// --- buildMovedRowWarning_ (most-rows-deferred warning text) ----------------
+var WH = ['title', 'description', 'status', 'grade', 'reasoning', 'age'];
+check('no moved rows: no warning', buildMovedRowWarning_(0, 3, {}, WH) === '');
+check('exactly half deferred is not "more than half"', buildMovedRowWarning_(2, 4, { 0: 2 }, WH) === '');
+check('one of one deferred warns', /^1 of 1 rows/.test(buildMovedRowWarning_(1, 1, { 5: 1 }, WH)));
+(function () {
+  var w = buildMovedRowWarning_(3, 4, { 5: 3, 0: 1 }, WH);
+  check('warning names the columns most-frequent first with counts', w.indexOf('age (3), title (1)') !== -1);
+  check('warning points at VOLATILE_FUNCTIONS', w.indexOf('VOLATILE_FUNCTIONS') !== -1);
+})();
+check('a width change is named as such', buildMovedRowWarning_(2, 2, { '-1': 2 }, WH).indexOf('row width (2)') !== -1);
+check('a column with no header is named by number', buildMovedRowWarning_(2, 2, { 6: 2 }, WH).indexOf('column 7 (2)') !== -1);
+(function () {
+  var saved = sandbox.GRADER_CONFIG.MOVED_ROW_WARN_RATIO;
+  sandbox.GRADER_CONFIG.MOVED_ROW_WARN_RATIO = 2;
+  check('a ratio above 1 disables the warning', buildMovedRowWarning_(3, 3, { 0: 3 }, WH) === '');
+  sandbox.GRADER_CONFIG.MOVED_ROW_WARN_RATIO = saved;
+})();
 
 // --- findVolatileColumns_ (per-column volatile detection) -------------------
 eq('no formulas: no volatile columns', findVolatileColumns_([[], []], 3), [false, false, false]);
@@ -411,6 +442,7 @@ function runScenario(opts) {
   sheets[cfg.CRITERIA_SHEET] = new FakeSheet([
     ['field', 'value'], ['criteria_text', 'grade it'], ['exclude_keywords', opts.keywords || '']
   ]);
+  if (opts.logGrid) sheets[cfg.LOG_SHEET] = new FakeSheet(opts.logGrid);  // a pre-existing Log sheet
   var ss = {
     getSheetByName: function (n) { return sheets[n] || null; },
     insertSheet: function (n) { sheets[n] = new FakeSheet([]); return sheets[n]; }
@@ -435,7 +467,9 @@ function runScenario(opts) {
   return {
     threw: threw, calls: calls, data: sheets[cfg.DATA_SHEET].grid,
     // Log-sheet row without run_at / elapsed_sec: [total, graded, rejected, errors, deferred]
-    logRow: log && log.grid.length === 2 ? log.grid[1].slice(1, 6) : null
+    logRow: log && log.grid.length === 2 ? log.grid[1].slice(1, 6) : null,
+    logNotes: log && log.grid.length === 2 ? log.grid[1][7] : null,  // the notes column
+    logHeader: log ? log.grid[0] : null
   };
 }
 function ok200(content) {
@@ -451,6 +485,7 @@ function ok200(content) {
     r.data[2][2] === 'graded' && r.data[2][3] === 'F' && r.calls === 1);
   eq('happy path: already-graded row untouched', r.data[3], ['Done already', 'x', 'graded', 'A', 'kept']);
   eq('happy path: Log row counts', r.logRow, [2, 1, 1, 0, 0]);
+  check('happy path: Log notes blank, header ends in notes', r.logNotes === '' && r.logHeader[7] === 'notes');
 })();
 
 // Missing key: the pre-existing config check still throws before any work.
@@ -505,6 +540,30 @@ function ok200(content) {
     r.data[1][2] === 'new' && r.data[1][3] === '' && r.data[2][2] === 'new' && r.data[2][3] === '');
   eq('moved rows: both rows deferred in the Log row', r.logRow, [2, 0, 0, 0, 2]);
   check('moved rows: a SKIP line was logged', logLines.some(function (l) { return l.indexOf('[SKIP]') !== -1; }));
+  check('moved rows: a WARNING line names the run', logLines.some(function (l) { return l.indexOf('WARNING: 2 of 2 rows were deferred') !== -1; }));
+  check('moved rows: the Log notes column names the columns that differed',
+    /^2 of 2 rows/.test(r.logNotes) && r.logNotes.indexOf('title (2)') !== -1);
+})();
+
+// Only one of three rows changes mid-run (a hand edit): deferred, but not most
+// of the run, so no warning is written.
+(function () {
+  var r = runScenario({ keywords: '', data: [HEADERS, ['One', 'a', 'new', '', ''], ['Two', 'b', 'new', '', ''], ['Three', 'c', 'new', '', '']],
+    respond: function (n, sheets) {
+      if (n === 3) sheets[cfg.DATA_SHEET].set(4, 2, 'edited mid-run');
+      return ok200('GRADE: B\nREASONING: Fine.');
+    } });
+  eq('one edited row: graded 2, deferred 1', r.logRow, [3, 2, 0, 0, 1]);
+  check('one edited row: no warning, notes blank', r.logNotes === '' &&
+    !logLines.some(function (l) { return l.indexOf('WARNING:') === 0; }));
+})();
+
+// A Log sheet created before the notes column existed gets its header relabeled.
+(function () {
+  var r = runScenario({ keywords: 'intern', logGrid: [['run_at', 'total', 'graded', 'rejected', 'errors', 'deferred', 'elapsed_sec']],
+    respond: function () { return ok200('GRADE: B\nREASONING: Fine.'); } });
+  eq('old Log sheet: header relabeled with notes', r.logHeader, RUN_LOG_HEADERS);
+  eq('old Log sheet: row still appended', r.logRow, [2, 1, 1, 0, 0]);
 })();
 
 // A one-row run that meets one transient provider error (5xx, or a 429 that
@@ -689,6 +748,27 @@ function ok200(content) {
   eq('header-anchored volatile spill + real sort: row 2 graded, the swapped pair deferred', r2.logRow, [3, 1, 0, 0, 2]);
   check('header-anchored volatile spill + real sort: no grade on the swapped rows',
     r2.data[2][3] === '' && r2.data[3][3] === '');
+})();
+
+// A spill whose volatility is indirect -- =ARRAYFORMULA($H$1-E2:E) with H1
+// holding =NOW() -- names no volatile function, so name matching can't flag it
+// and every row after the first is deferred. The run can't fix that, but it
+// must say so: a WARNING in the log and the Log sheet's notes column naming
+// the column, instead of silently wasting the same API calls every run.
+(function () {
+  var H = HEADERS.concat(['age']);
+  var data = [H, ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1], ['Three', 'c', 'new', '', '', 1]];
+  var formulas = [[], ['', '', '', '', '', '=ARRAYFORMULA($H$1-E2:E)'], [], []];
+  var r = runScenario({ data: data, formulas: formulas, respond: function (n, sheets) {
+    var g = sheets[cfg.DATA_SHEET].grid;
+    for (var i = 1; i < g.length; i++) g[i][5] += 1;  // recalculation via the helper cell
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  check('indirect volatile spill: does not throw', r.threw === null);
+  eq('indirect volatile spill: row 2 graded, the rest deferred', r.logRow, [3, 1, 0, 0, 2]);
+  check('indirect volatile spill: notes name the age column',
+    /^2 of 3 rows/.test(r.logNotes) && r.logNotes.indexOf('age (2)') !== -1 && r.logNotes.indexOf('title') === -1);
+  check('indirect volatile spill: WARNING logged', logLines.some(function (l) { return l.indexOf('WARNING: 2 of 3 rows') !== -1; }));
 })();
 
 // --- placeholder sentinel regression guard ---------------------------------

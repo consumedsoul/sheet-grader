@@ -53,8 +53,9 @@ real Apps Script services only run bound to a real sheet — but the Node test h
 directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/fetch
 (happy path, rejected key, retired model, transient blip, non-JSON 200, row moved mid-run,
 volatile formula column, formula-backed rows sorted mid-run, volatile `ARRAYFORMULA`
-spill column anchored in row 2 or in the header cell, each with and without a sort).
-Run it after touching
+spill column anchored in row 2 or in the header cell, each with and without a sort,
+an indirectly volatile spill that trips the most-rows-deferred warning, and a Log sheet
+from before the `notes` column). Run it after touching
 anything; add a scenario there when touching the loop or a failure path.
 
 ## Architecture (one file, top-down in `Grader.js`)
@@ -66,27 +67,32 @@ anything; add a scenario there when touching the loop or a failure path.
 - `gradeNewRows()` — the only entry point. Schedule it with a time-based trigger.
   Takes a `LockService` script lock, validates key + criteria, maps headers→columns
   (`resolveColumns_`), then loops rows calling `gradeOneRow_` and pacing against the rate
-  limit. Respects a timer budget so it can resume across runs.
+  limit. Respects a timer budget so it can resume across runs. After the loop it builds
+  the most-rows-deferred warning (`buildMovedRowWarning_`, gated on
+  `MOVED_ROW_WARN_RATIO`) from the per-column tally of moved-row skips, logs it, and
+  hands it to `appendRunLog_` for the Log sheet's `notes` column.
 - `gradeOneRow_` — Stage 1 (regex reject, no API call) → Stage 2 (LLM) → write back for a
-  single row. Returns `{ outcome, madeApiCall, fatal, transient }`; the caller uses
+  single row. Returns `{ outcome, madeApiCall, fatal, transient, changedCols }`; the caller uses
   `outcome` for stats, `madeApiCall` to decide whether to sleep (auto-rejects don't
   sleep), `fatal` (an error message, set when `callLlmApi_` threw a `fatal`-tagged error)
   to stop the run, and `transient` (set when it threw a `transient`-tagged 429/5xx error)
-  to leave that error out of the all-failed guard.
-  Before either write it calls `rowStillInPlace_`, which re-reads the row and compares it
+  to leave that error out of the all-failed guard, and `changedCols` (on a `skipped`
+  outcome: the column indexes that differed, or `null` for a width change) to tally
+  which columns keep deferring rows.
+  Before either write it calls `findRowChanges_`, which re-reads the row and compares it
   to the `_snapshot` taken by `getUngradedRows_`, comparing cells that held a formula by
   their `_formulas` text instead of their value, and not comparing formula-less cells in
   a `_volatileCols` column (the spill of a volatile array formula, see
-  `findVolatileColumns_`); a mismatch skips the write (outcome `skipped`) so a sort
+  `findVolatileColumns_`); any difference skips the write (outcome `skipped`) so a sort
   mid-run can't put a grade on the wrong row.
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
   `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
   `normalizeConfig_` (runs once at load), `getUngradedRows_` / `findVolatileColumns_`,
-  `rowStillInPlace_` / `rowMatchesSnapshot_`, `findRowTitle_` /
+  `findRowChanges_` / `findChangedColumns_` / `rowMatchesSnapshot_`, `findRowTitle_` /
   `hasTitleColumn_` / `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`,
   `buildGradingPrompt_`, `parseGradeResponse_`, `updateRowGrade_`,
-  `buildRunLogRow_` / `appendRunLog_`
+  `buildMovedRowWarning_`, `buildRunLogRow_` / `appendRunLog_`
   (end-of-run summary to the `Log` sheet, gated on `ENABLE_RUN_LOG`).
   The sheet-I/O helpers keep their parsing in a pure companion
   (`getOrCreateCriteria_` → `parseCriteriaValues_`, `getUngradedRows_` →
@@ -177,7 +183,12 @@ anything; add a scenario there when touching the loop or a failure path.
   formula-less cells of a column whose formula names a `VOLATILE_FUNCTIONS` entry (an
   `=ARRAYFORMULA(NOW()-…)` spill) are not compared at all, so a sort is only caught there
   through the row's other columns; a sheet whose *every* content column is such a spill
-  has no moved-row protection.
+  has no moved-row protection. A spill whose volatility is *indirect*
+  (`=ARRAYFORMULA($H$1-E2:E)` with `H1` holding `=NOW()`) names no volatile function
+  and still defers every row after the first; name matching can't close that. What the
+  run does instead is say so: when more than `MOVED_ROW_WARN_RATIO` of its rows were
+  deferred as moved, it logs a WARNING naming the columns that differed and writes it
+  to the Log sheet's `notes` column (2026-10-30 audit).
 - A provider outage that fails every row in a run no longer emails the owner (transient
   errors don't trip the all-failed guard). It shows as `errors` in the Log sheet instead.
 
@@ -187,8 +198,10 @@ anything; add a scenario there when touching the loop or a failure path.
   rate-limit sleep gated on `madeApiCall` so auto-rejects stay free, keep the `fatal` break
   and the all-failed throw after the Log write (fed by `hardErrors`, not `stats.errors`),
   and keep `stats.skipped` additive (`+=`) — moved rows and the timer budget both feed it.
+  Keep `movedRows` counting only `skipped` outcomes from `gradeOneRow_` (never the timer
+  budget or a fatal stop), or the deferral warning fires on every long backlog.
   Add a scenario to the end-to-end section of `tests/run.js`.
-- Changing `rowStillInPlace_` / `getUngradedRows_`? Keep `_formulas` in step with
+- Changing `findRowChanges_` / `getUngradedRows_`? Keep `_formulas` in step with
   `_snapshot` (same width, read from the same range), and compare formula cells by text,
   never by value and never by skipping them — a volatile formula column otherwise defers
   every row after paying for its API call, and skipping them outright put grades on the
