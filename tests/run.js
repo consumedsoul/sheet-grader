@@ -315,6 +315,8 @@ check('skipCols does not excuse a width change',
 eq('no formulas: no volatile columns', findVolatileColumns_([[], []], 3), [false, false, false]);
 eq('anchor-only volatile array formula flags its column',
   findVolatileColumns_([['', '=ARRAYFORMULA(NOW()-E2:E)', ''], ['', '', '']], 3), [false, true, false]);
+eq('a header-cell array formula wrapping a volatile function flags its column',
+  findVolatileColumns_([['', '={"age"; ARRAYFORMULA(IF(E2:E="",,NOW()-E2:E))}'], ['', ''], ['', '']], 2), [false, true]);
 eq('per-row volatile formulas flag their column too',
   findVolatileColumns_([['', '', '=TODAY()-F2'], ['', '', '=today()-F3']], 3), [false, false, true]);
 eq('a non-volatile formula column is not flagged',
@@ -652,6 +654,40 @@ function ok200(content) {
   } });
   eq('volatile ARRAYFORMULA spill + real sort: row 2 graded, the swapped pair deferred', r2.logRow, [3, 1, 0, 0, 2]);
   check('volatile ARRAYFORMULA spill + real sort: no grade on the swapped rows',
+    r2.data[2][3] === '' && r2.data[3][3] === '');
+})();
+
+// The same spill anchored in the header cell -- ={"age"; ARRAYFORMULA(NOW()-E2:E)}
+// in F1, so header and column travel together -- leaves *no* data cell with
+// formula text. Detection that read rows 2.. only missed it and deferred every
+// row after paying for its call (2026-10-30 audit); the header row is read too.
+(function () {
+  var H = HEADERS.concat(['age']);
+  function grid() {
+    return [H, ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1], ['Three', 'c', 'new', '', '', 1]];
+  }
+  var HEADER_ANCHOR = '={"age"; ARRAYFORMULA(IF(E2:E="",,NOW()-E2:E))}';
+  function fx() { return [['', '', '', '', '', HEADER_ANCHOR], [], [], []]; }
+  function tick(sheets) {  // recalculation: every spilled cell changes on every call
+    var g = sheets[cfg.DATA_SHEET].grid;
+    for (var i = 1; i < g.length; i++) g[i][5] += 1;
+  }
+  var r = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+    tick(sheets);
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  check('header-anchored volatile spill: does not throw', r.threw === null);
+  eq('header-anchored volatile spill: all rows graded, none deferred', r.logRow, [3, 3, 0, 0, 0]);
+  check('header-anchored volatile spill: grades landed', r.data[1][3] === 'B' && r.data[2][3] === 'B' && r.data[3][3] === 'B');
+
+  // Same sheet, rows 3 and 4 swapped mid-run: the plain columns still catch it.
+  var r2 = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+    tick(sheets);
+    if (n === 1) sheets[cfg.DATA_SHEET].swapRows(3, 4);  // one sort, during the first row's API call
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  eq('header-anchored volatile spill + real sort: row 2 graded, the swapped pair deferred', r2.logRow, [3, 1, 0, 0, 2]);
+  check('header-anchored volatile spill + real sort: no grade on the swapped rows',
     r2.data[2][3] === '' && r2.data[3][3] === '');
 })();
 

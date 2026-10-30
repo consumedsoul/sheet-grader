@@ -645,7 +645,11 @@ function getUngradedRows_(sheet, headers, colMap) {
   // '' means the cell holds a plain value -- or sits under an array formula
   // whose text lives only in its top cell, which findVolatileColumns_ handles.
   var formulas = range.getFormulas();
-  var volatileCols = findVolatileColumns_(formulas, headers.length);
+  // The header row is read too: a common layout anchors the array formula in
+  // the header cell (={"age"; ARRAYFORMULA(NOW()-E2:E)} in F1) so the header
+  // and its column travel together, and then no data cell carries the text.
+  var headerFormulas = sheet.getRange(1, 1, 1, headers.length).getFormulas();
+  var volatileCols = findVolatileColumns_(headerFormulas.concat(formulas), headers.length);
   var statusIdx = colMap[GRADER_CONFIG.STATUS_COLUMN] - 1;
   var rows = [];
 
@@ -669,12 +673,14 @@ function getUngradedRows_(sheet, headers, colMap) {
 
 /**
  * One boolean per column: true when any formula in that column (over the
- * whole read range, not just the gradable rows) names a function in
- * GRADER_CONFIG.VOLATILE_FUNCTIONS. An array formula such as
- * =ARRAYFORMULA(NOW()-E2:E) holds its text in the top cell only; the cells it
- * spills into read back from getFormulas() as '' yet change value on every
- * grade written, so comparing them by value would defer every row after the
- * first (2026-10-23 audit). rowMatchesSnapshot_ skips the value comparison of
+ * header row and the whole data range, not just the gradable rows) names a
+ * function in GRADER_CONFIG.VOLATILE_FUNCTIONS. An array formula such as
+ * =ARRAYFORMULA(NOW()-E2:E) holds its text in its top cell only -- row 2, or
+ * row 1 when written as ={"age"; ARRAYFORMULA(...)} in the header cell; the
+ * cells it spills into read back from getFormulas() as '' yet change value on
+ * every grade written, so comparing them by value would defer every row after
+ * the first (2026-10-23 audit), or every row at all when the anchor is the
+ * header (2026-10-30 audit). rowMatchesSnapshot_ skips the value comparison of
  * formula-less cells in these columns; cells that do carry formula text are
  * still compared by text. Case-insensitive; a volatile function spelled inside
  * a string literal counts too, which only costs that column its value check.

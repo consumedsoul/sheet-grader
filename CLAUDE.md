@@ -53,7 +53,8 @@ real Apps Script services only run bound to a real sheet — but the Node test h
 directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/fetch
 (happy path, rejected key, retired model, transient blip, non-JSON 200, row moved mid-run,
 volatile formula column, formula-backed rows sorted mid-run, volatile `ARRAYFORMULA`
-spill column with and without a sort). Run it after touching
+spill column anchored in row 2 or in the header cell, each with and without a sort).
+Run it after touching
 anything; add a scenario there when touching the loop or a failure path.
 
 ## Architecture (one file, top-down in `Grader.js`)
@@ -196,8 +197,10 @@ anything; add a scenario there when touching the loop or a failure path.
   that `findVolatileColumns_` flagged (a volatile `ARRAYFORMULA` holds its text in the
   top cell only, and its spill changes value on every write) — otherwise one such
   column deferred every row after the first, each after paying for its call
-  (2026-10-23 audit). Keep that detection reading the *whole* range, not just the
-  gradable rows: the anchor sits in row 2, which is usually already graded.
+  (2026-10-23 audit). Keep that detection reading the *whole* range plus the header
+  row, not just the gradable rows: the anchor sits in row 2, which is usually already
+  graded, or in row 1 when written as `={"age"; ARRAYFORMULA(…)}` in the header cell
+  (2026-10-30 audit).
 - Adding a provider? Usually only `API_ENDPOINT` / `API_MODEL` / key need to change —
   plus `REASONING_EFFORT`, which is only sent when non-empty; blank it for providers
   that reject the parameter. One exception: `MAX_OUTPUT_TOKENS` goes out as

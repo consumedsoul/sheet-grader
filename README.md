@@ -97,10 +97,11 @@ A few details worth knowing:
   doesn't make every row look moved, while a sort — which moves each row's
   formulas along with it — is still caught even when every content column is a
   formula. A column filled by a single array formula (`=ARRAYFORMULA(NOW()-E2:E)`
-  in its top cell) holds formula text in that top cell only, so when the formula
-  names a volatile function (`VOLATILE_FUNCTIONS`, default `NOW`, `TODAY`,
-  `RAND`, `RANDBETWEEN`, `RANDARRAY`) the cells it spills into aren't compared
-  at all; the row's plain columns still catch a sort. What this can't see is a
+  in its top cell, or `={"age"; ARRAYFORMULA(NOW()-E2:E)}` in the header cell)
+  holds formula text in that top cell only, so when the formula names a volatile
+  function (`VOLATILE_FUNCTIONS`, default `NOW`, `TODAY`, `RAND`, `RANDBETWEEN`,
+  `RANDARRAY`) the cells it spills into aren't compared at all; the row's plain
+  columns still catch a sort. What this can't see is a
   change in a formula's *inputs* (an edit on the tab a `=VLOOKUP` reads from)
   while a run is in progress.
 
@@ -366,7 +367,8 @@ stubbed, so the assertions run against the actual source. It also runs
 services, covering the happy path, a rejected key, a retired model, a
 transient provider blip, a non-JSON `200`, a row that moves mid-run, a volatile
 formula column, formula-backed content columns sorted mid-run, and a volatile
-`ARRAYFORMULA` column filled from its top cell (with and without a sort). Real
+`ARRAYFORMULA` column filled from its top cell or its header cell (with and
+without a sort). Real
 Sheets and network behavior still only run bound to a real spreadsheet.
 
 ## License
