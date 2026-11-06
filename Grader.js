@@ -362,8 +362,8 @@ function gradeNewRows() {
 
     // A run that deferred most of the rows it reached as "moved" is either a
     // sort that happened mid-run (fine, once) or a column that changes on its
-    // own and will defer the same rows every run, each after paying for its
-    // API call. Name the columns so the Log sheet explains itself either way.
+    // own and will defer the same rows every run, so the backlog never
+    // shrinks. Name the columns so the Log sheet explains itself either way.
     var movedWarning = buildMovedRowWarning_(movedRows, reachedRows, changedColCounts, headers,
       stats.total - reachedRows);
     if (movedWarning) Logger.log('WARNING: ' + movedWarning);
@@ -444,6 +444,9 @@ function resolveColumns_(colMap, dupKeys) {
 /**
  * Grades a single row and writes the result back. Runs Stage 1 (cheap exclude-
  * keyword reject, no API call) then Stage 2 (LLM) only if the row survives.
+ * The row is re-checked against its snapshot (findRowChanges_) before every
+ * write, and in Stage 2 before the API call too, so a row that has already
+ * moved is skipped for free.
  *
  * Returns { outcome, madeApiCall, fatal, transient, changedCols } where outcome
  * is one of 'graded', 'rejected', 'skipped' or 'errors' (keyed to match the
@@ -475,7 +478,16 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
     return { outcome: 'rejected', madeApiCall: false };
   }
 
-  // Stage 2: LLM grading.
+  // Stage 2: LLM grading. Check the row is still in place before paying for
+  // the call as well as after it: a row that already moved or changed would
+  // only be skipped once the reply came back, and a column that changes on its
+  // own did that to every row after the first, every run (2026-11-06 audit).
+  // One extra read per row; a skip here makes no API call, so no pacing sleep.
+  drift = findRowChanges_(sheet, row);
+  if (drift === null || drift.length) {
+    Logger.log('  [SKIP] Row ' + row._row + ' (' + titleHint + ') moved or changed since the run started -- not calling the API; it will be graded next run.');
+    return { outcome: 'skipped', madeApiCall: false, changedCols: drift };
+  }
   try {
     var prompt = buildGradingPrompt_(criteriaText, row);
     var responseText = callLlmApi_(apiKey, prompt);
@@ -491,6 +503,7 @@ function gradeOneRow_(sheet, row, cols, criteriaText, excludeKeywords, apiKey) {
       return { outcome: 'errors', madeApiCall: true };
     }
 
+    // Again after the call: a sort can land while the request is in flight.
     drift = findRowChanges_(sheet, row);
     if (drift === null || drift.length) {
       Logger.log('  [SKIP] Row ' + row._row + ' (' + titleHint + ') moved or changed since the run started -- not writing; it will be graded next run.');
@@ -749,13 +762,14 @@ function findVolatileColumns_(formulas, width) {
 }
 
 /**
- * Re-reads a row right before its grade is written and reports which columns
+ * Re-reads a row (before its API call and again right before its grade is
+ * written) and reports which columns
  * no longer hold the values captured at the start of the run: an array of
  * 0-based column indexes ([] means the row is still in place), or null when the
  * row's width changed (a column was inserted or removed). A backlog run lasts
  * up to TIMER_BUDGET_SEC, and sorting the Data tab (or inserting rows above)
  * in that window renumbers every row -- without this check the grade would
- * land on whichever row now sits at that number. Costs one read per write.
+ * land on whichever row now sits at that number. Costs one read per check.
  * Cells that held a formula at snapshot time are compared by formula text, not
  * value (see getUngradedRows_): a volatile column must not make every row look
  * moved, but a row whose formulas moved with it must. The formulas are only

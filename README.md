@@ -88,10 +88,11 @@ A few details worth knowing:
 - **Truncates long fields** in the prompt so token use stays predictable
   even if someone pastes a 50KB description into a cell.
 - **Don't sort or insert rows in the Data tab while a run is in progress.**
-  Each row is re-read right before its grade is written. If it has moved or
-  changed since the run started, the write is skipped with a warning, the row
-  counts as `deferred`, and it's graded on the next run — rather than landing
-  on whatever row now sits at that number. Cells that hold a formula are
+  Each row is re-read before its API call and again right before its grade is
+  written. If it has moved or changed since the run started, it is skipped
+  with a warning (before the call when the change is already there, so it
+  costs nothing), the row counts as `deferred`, and it's graded on the next
+  run — rather than landing on whatever row now sits at that number. Cells that hold a formula are
   compared by their formula text rather than their value, so a volatile column
   (`=NOW()`, `=TODAY()-scraped_at`, `=RAND()`) that recalculates on every write
   doesn't make every row look moved, while a sort — which moves each row's
@@ -390,8 +391,9 @@ transient provider blip, a non-JSON `200`, a row that moves mid-run, a volatile
 formula column, formula-backed content columns sorted mid-run, and a volatile
 `ARRAYFORMULA` column filled from its top cell or its header cell (with and
 without a sort), an indirectly volatile column that trips the deferral warning,
-a 200-row backlog that outlasts the timer budget on a fake clock (with that
-column and without), and a Log sheet from before the `notes` column. Real
+a 200-row backlog on a fake clock (outlasting the timer budget with rows
+edited mid-call and with nothing moving, and skipped for one API call with
+that column), and a Log sheet from before the `notes` column. Real
 Sheets and network behavior still only run bound to a real spreadsheet.
 
 ## License

@@ -55,7 +55,8 @@ directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/f
 volatile formula column, formula-backed rows sorted mid-run, volatile `ARRAYFORMULA`
 spill column anchored in row 2 or in the header cell, each with and without a sort,
 an indirectly volatile spill that trips the most-rows-deferred warning, a 200-row
-backlog that outlasts the timer budget on a fake clock, with and without that spill,
+backlog on a fake clock — outlasting the timer budget with rows edited mid-call and
+with nothing moving, and skipped for one API call with that spill —
 and a Log sheet from before the `notes` column). Run it after touching
 anything; add a scenario there when touching the loop or a failure path.
 
@@ -81,12 +82,14 @@ anything; add a scenario there when touching the loop or a failure path.
   to leave that error out of the all-failed guard, and `changedCols` (on a `skipped`
   outcome: the column indexes that differed, or `null` for a width change) to tally
   which columns keep deferring rows.
-  Before either write it calls `findRowChanges_`, which re-reads the row and compares it
+  Before either write, and in Stage 2 before the API call too (a skip there returns
+  `madeApiCall: false`), it calls `findRowChanges_`, which re-reads the row and compares it
   to the `_snapshot` taken by `getUngradedRows_`, comparing cells that held a formula by
   their `_formulas` text instead of their value, and not comparing formula-less cells in
   a `_volatileCols` column (the spill of a volatile array formula, see
-  `findVolatileColumns_`); any difference skips the write (outcome `skipped`) so a sort
-  mid-run can't put a grade on the wrong row.
+  `findVolatileColumns_`); any difference skips the row (outcome `skipped`) so a sort
+  mid-run can't put a grade on the wrong row, and a row already known to have changed
+  isn't paid for.
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
   `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
@@ -179,16 +182,18 @@ anything; add a scenario there when touching the loop or a failure path.
   in-memory Sheets/fetch stand-ins. Real Sheets and network behavior still only run bound
   to a sheet.
 - A row that moves or changes mid-run is skipped and deferred, not graded. Legit mid-run
-  edits to a row's *plain-value* cells therefore push that row to the next run (one extra
-  API call). Formula cells are compared by formula text, not value, so a change in a
+  edits to a row's *plain-value* cells therefore push that row to the next run (costing
+  an API call only when the edit lands while that row's own call is in flight). Formula cells are compared by formula text, not value, so a change in a
   formula's *inputs* (an edit on the tab a `=VLOOKUP` reads from) is not caught. The
   formula-less cells of a column whose formula names a `VOLATILE_FUNCTIONS` entry (an
   `=ARRAYFORMULA(NOW()-…)` spill) are not compared at all, so a sort is only caught there
   through the row's other columns; a sheet whose *every* content column is such a spill
   has no moved-row protection. A spill whose volatility is *indirect*
   (`=ARRAYFORMULA($H$1-E2:E)` with `H1` holding `=NOW()`) names no volatile function
-  and still defers every row after the first; name matching can't close that. What the
-  run does instead is say so: when more than `MOVED_ROW_WARN_RATIO` of the rows it
+  and still defers every row after the first; name matching can't close that. Those
+  rows are caught by the check before the API call, so they cost a sheet read each, not
+  a call (2026-11-06 audit), but the backlog still only shrinks by one row a run. What
+  the run does about that is say so: when more than `MOVED_ROW_WARN_RATIO` of the rows it
   reached were deferred as moved, it logs a WARNING naming the columns that differed and
   writes it to the Log sheet's `notes` column (2026-10-30 audit).
 - A provider outage that fails every row in a run no longer emails the owner (transient
@@ -205,6 +210,9 @@ anything; add a scenario there when touching the loop or a failure path.
   denominator `reachedRows`, not `stats.total`: against the whole backlog, a 200-row
   sheet where every reached row deferred read as 38 of 200 and never warned
   (2026-11-06 audit). The fake-clock scenarios in `tests/run.js` pin both directions.
+  Keep both `findRowChanges_` calls in Stage 2 of `gradeOneRow_`: the one before the API
+  call is what stops a self-changing column burning ~38 calls a run, the one after it is
+  what catches a sort that lands mid-call. The first must return `madeApiCall: false`.
   Add a scenario to the end-to-end section of `tests/run.js`.
 - Changing `findRowChanges_` / `getUngradedRows_`? Keep `_formulas` in step with
   `_snapshot` (same width, read from the same range), and compare formula cells by text,

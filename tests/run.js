@@ -770,6 +770,7 @@ function ok200(content) {
     return ok200('GRADE: B\nREASONING: Fine.');
   } });
   eq('header-anchored volatile spill + real sort: row 2 graded, the swapped pair deferred', r2.logRow, [3, 1, 0, 0, 2]);
+  eq('header-anchored volatile spill + real sort: the swapped pair is skipped before its API call', r2.calls, 1);
   check('header-anchored volatile spill + real sort: no grade on the swapped rows',
     r2.data[2][3] === '' && r2.data[3][3] === '');
 })();
@@ -778,7 +779,8 @@ function ok200(content) {
 // holding =NOW() -- names no volatile function, so name matching can't flag it
 // and every row after the first is deferred. The run can't fix that, but it
 // must say so: a WARNING in the log and the Log sheet's notes column naming
-// the column, instead of silently wasting the same API calls every run.
+// the column. And it must not pay for them: the rows after the first have
+// already changed by the time they come up, so they are skipped before the call.
 (function () {
   var H = HEADERS.concat(['age']);
   var data = [H, ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1], ['Three', 'c', 'new', '', '', 1]];
@@ -790,6 +792,7 @@ function ok200(content) {
   } });
   check('indirect volatile spill: does not throw', r.threw === null);
   eq('indirect volatile spill: row 2 graded, the rest deferred', r.logRow, [3, 1, 0, 0, 2]);
+  eq('indirect volatile spill: only the graded row cost an API call', r.calls, 1);
   check('indirect volatile spill: notes name the age column',
     /^2 of 3 rows/.test(r.logNotes) && r.logNotes.indexOf('age (2)') !== -1 && r.logNotes.indexOf('title') === -1);
   check('indirect volatile spill: WARNING logged', logLines.some(function (l) { return l.indexOf('WARNING: 2 of 3 rows') !== -1; }));
@@ -804,30 +807,52 @@ function ok200(content) {
   var notReached = TOTAL - reached;
   check('timer scenario: the backlog outlasts one run', reached > 2 && notReached > reached);
 
-  // The indirect spill again: every reached row after the first is deferred as
-  // moved. Measured against the whole backlog that is well under half and the
-  // note stayed blank for a hundred-odd runs; measured against the rows the
-  // run reached it is nearly all of them (2026-11-06 audit).
+  // Every reached row is rewritten while its own API call is in flight (a
+  // script or a collaborator editing the row being graded), so each one passes
+  // the check before the call, pays for it, and is deferred after it. Measured
+  // against the whole backlog that is well under half and the note stayed
+  // blank; measured against the rows the run reached it is all of them
+  // (2026-11-06 audit).
+  var busy = [HEADERS.slice()];
+  for (var i = 0; i < TOTAL; i++) busy.push(['Row ' + i, 'b', 'new', '', '']);
+  var r = runScenario({ fakeClock: true, data: busy, respond: function (n, sheets) {
+    sheets[cfg.DATA_SHEET].grid[n][1] += '!';  // the n-th call is for sheet row n+1
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  check('timer + rows edited in flight: does not throw', r.threw === null);
+  eq('timer + rows edited in flight: one API call per reached row', r.calls, reached);
+  eq('timer + rows edited in flight: nothing graded, everything deferred', r.logRow, [TOTAL, 0, 0, 0, TOTAL]);
+  check('timer + rows edited in flight: no grade written', busy.every(function (row, idx) { return idx === 0 || row[3] === ''; }));
+  check('timer + rows edited in flight: notes warn against the rows reached, not the backlog',
+    typeof r.logNotes === 'string' &&
+    r.logNotes.indexOf(reached + ' of ' + reached + ' rows this run reached were deferred') === 0 &&
+    r.logNotes.indexOf('(' + notReached + ' more were not reached)') !== -1 &&
+    r.logNotes.indexOf('body (' + reached + ')') !== -1);
+  check('timer + rows edited in flight: timer stop logged',
+    logLines.some(function (l) { return l.indexOf('Hit timer budget') !== -1; }));
+
+  // The indirect spill on the same backlog. Every row after the first has
+  // already changed when it comes up, so it is skipped before its API call:
+  // one call for the whole run instead of one per reached row, no pacing
+  // sleeps, and the run gets through the entire backlog and says so.
   var H = HEADERS.concat(['age']);
   var data = [H];
-  for (var i = 0; i < TOTAL; i++) data.push(['Row ' + i, 'b', 'new', '', '', 1]);
+  for (var m = 0; m < TOTAL; m++) data.push(['Row ' + m, 'b', 'new', '', '', 1]);
   var formulas = [[], ['', '', '', '', '', '=ARRAYFORMULA($H$1-E2:E)']];
-  var r = runScenario({ fakeClock: true, data: data, formulas: formulas, respond: function (n, sheets) {
+  var r3 = runScenario({ fakeClock: true, data: data, formulas: formulas, respond: function (n, sheets) {
     var g = sheets[cfg.DATA_SHEET].grid;
     for (var j = 1; j < g.length; j++) g[j][5] += 1;  // recalculation via the helper cell
     return ok200('GRADE: B\nREASONING: Fine.');
   } });
-  var moved = reached - 1;
-  check('timer + indirect spill: does not throw', r.threw === null);
-  eq('timer + indirect spill: one API call per reached row', r.calls, reached);
-  eq('timer + indirect spill: one graded, everything else deferred', r.logRow, [TOTAL, 1, 0, 0, TOTAL - 1]);
-  check('timer + indirect spill: notes warn against the rows reached, not the backlog',
-    typeof r.logNotes === 'string' &&
-    r.logNotes.indexOf(moved + ' of ' + reached + ' rows this run reached were deferred') === 0 &&
-    r.logNotes.indexOf('(' + notReached + ' more were not reached)') !== -1 &&
-    r.logNotes.indexOf('age (' + moved + ')') !== -1);
-  check('timer + indirect spill: timer stop logged',
-    logLines.some(function (l) { return l.indexOf('Hit timer budget') !== -1; }));
+  check('backlog + indirect spill: does not throw', r3.threw === null);
+  eq('backlog + indirect spill: one API call for the whole run', r3.calls, 1);
+  eq('backlog + indirect spill: one graded, everything else deferred', r3.logRow, [TOTAL, 1, 0, 0, TOTAL - 1]);
+  check('backlog + indirect spill: every row was reached, so the timer never stopped the run',
+    !logLines.some(function (l) { return l.indexOf('Hit timer budget') !== -1; }));
+  check('backlog + indirect spill: notes name the age column for the whole backlog',
+    typeof r3.logNotes === 'string' &&
+    r3.logNotes.indexOf((TOTAL - 1) + ' of ' + TOTAL + ' rows were deferred') === 0 &&
+    r3.logNotes.indexOf('age (' + (TOTAL - 1) + ')') !== -1);
 
   // The same backlog with nothing moving: the timer defers most rows, and that
   // alone must never read as "rows moved" -- no note, no WARNING.
