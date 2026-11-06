@@ -54,8 +54,9 @@ directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/f
 (happy path, rejected key, retired model, transient blip, non-JSON 200, row moved mid-run,
 volatile formula column, formula-backed rows sorted mid-run, volatile `ARRAYFORMULA`
 spill column anchored in row 2 or in the header cell, each with and without a sort,
-an indirectly volatile spill that trips the most-rows-deferred warning, and a Log sheet
-from before the `notes` column). Run it after touching
+an indirectly volatile spill that trips the most-rows-deferred warning, a 200-row
+backlog that outlasts the timer budget on a fake clock, with and without that spill,
+and a Log sheet from before the `notes` column). Run it after touching
 anything; add a scenario there when touching the loop or a failure path.
 
 ## Architecture (one file, top-down in `Grader.js`)
@@ -69,7 +70,8 @@ anything; add a scenario there when touching the loop or a failure path.
   (`resolveColumns_`), then loops rows calling `gradeOneRow_` and pacing against the rate
   limit. Respects a timer budget so it can resume across runs. After the loop it builds
   the most-rows-deferred warning (`buildMovedRowWarning_`, gated on
-  `MOVED_ROW_WARN_RATIO`) from the per-column tally of moved-row skips, logs it, and
+  `MOVED_ROW_WARN_RATIO`, measured against `reachedRows` — the rows handed to
+  `gradeOneRow_` — not `stats.total`) from the per-column tally of moved-row skips, logs it, and
   hands it to `appendRunLog_` for the Log sheet's `notes` column.
 - `gradeOneRow_` — Stage 1 (regex reject, no API call) → Stage 2 (LLM) → write back for a
   single row. Returns `{ outcome, madeApiCall, fatal, transient, changedCols }`; the caller uses
@@ -186,9 +188,9 @@ anything; add a scenario there when touching the loop or a failure path.
   has no moved-row protection. A spill whose volatility is *indirect*
   (`=ARRAYFORMULA($H$1-E2:E)` with `H1` holding `=NOW()`) names no volatile function
   and still defers every row after the first; name matching can't close that. What the
-  run does instead is say so: when more than `MOVED_ROW_WARN_RATIO` of its rows were
-  deferred as moved, it logs a WARNING naming the columns that differed and writes it
-  to the Log sheet's `notes` column (2026-10-30 audit).
+  run does instead is say so: when more than `MOVED_ROW_WARN_RATIO` of the rows it
+  reached were deferred as moved, it logs a WARNING naming the columns that differed and
+  writes it to the Log sheet's `notes` column (2026-10-30 audit).
 - A provider outage that fails every row in a run no longer emails the owner (transient
   errors don't trip the all-failed guard). It shows as `errors` in the Log sheet instead.
 
@@ -199,7 +201,10 @@ anything; add a scenario there when touching the loop or a failure path.
   and the all-failed throw after the Log write (fed by `hardErrors`, not `stats.errors`),
   and keep `stats.skipped` additive (`+=`) — moved rows and the timer budget both feed it.
   Keep `movedRows` counting only `skipped` outcomes from `gradeOneRow_` (never the timer
-  budget or a fatal stop), or the deferral warning fires on every long backlog.
+  budget or a fatal stop), or the deferral warning fires on every long backlog. Keep its
+  denominator `reachedRows`, not `stats.total`: against the whole backlog, a 200-row
+  sheet where every reached row deferred read as 38 of 200 and never warned
+  (2026-11-06 audit). The fake-clock scenarios in `tests/run.js` pin both directions.
   Add a scenario to the end-to-end section of `tests/run.js`.
 - Changing `findRowChanges_` / `getUngradedRows_`? Keep `_formulas` in step with
   `_snapshot` (same width, read from the same range), and compare formula cells by text,

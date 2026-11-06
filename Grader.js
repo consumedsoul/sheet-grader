@@ -73,9 +73,11 @@ var GRADER_CONFIG = {
   // Set false to disable. The Log sheet is created on first write.
   ENABLE_RUN_LOG: true,
 
-  // When more than this share of a run's rows are deferred because they moved
-  // or changed mid-run, the run logs a WARNING naming the columns that differed
-  // and writes it to the Log sheet's notes column. One sort or edit during a
+  // When more than this share of the rows a run reached are deferred because
+  // they moved or changed mid-run, the run logs a WARNING naming the columns
+  // that differed and writes it to the Log sheet's notes column. Rows the timer
+  // budget never got to don't count, so a long backlog can't dilute the share
+  // below the threshold. One sort or edit during a
   // run is normal; the same column named run after run means it changes on its
   // own (a formula recalculating through a helper cell, which VOLATILE_FUNCTIONS
   // can't see by name). 0.5 = more than half. Set it above 1 to disable.
@@ -303,6 +305,10 @@ function gradeNewRows() {
     // -1 when the row's width changed. Fed to buildMovedRowWarning_ after the loop.
     var movedRows = 0;
     var changedColCounts = {};
+    // Rows actually handed to gradeOneRow_. The warning's denominator: against
+    // stats.total, a 200-row backlog where all ~38 rows a run can reach were
+    // deferred reads as 38 of 200 and never warns (2026-11-06 audit).
+    var reachedRows = 0;
     // Set when a row fails in a way no later row can recover from (rejected
     // key, unknown model). The loop stops, the Log row is still written so the
     // failure is visible in the sheet, and then the run throws so Apps Script
@@ -330,6 +336,7 @@ function gradeNewRows() {
 
       var result = gradeOneRow_(sheet, rows[i], cols, criteriaText, excludeKeywords, apiKey);
       stats[result.outcome]++;
+      reachedRows++;
       if (result.outcome === 'errors' && !result.transient) hardErrors++;
       if (result.outcome === 'skipped') {
         movedRows++;
@@ -353,11 +360,12 @@ function gradeNewRows() {
     Logger.log('=== Done: ' + stats.graded + ' graded, ' + stats.rejected + ' auto-rejected, ' +
       stats.errors + ' errors, ' + stats.skipped + ' deferred in ' + totalElapsedSec.toFixed(1) + 's ===');
 
-    // A run that deferred most of its rows as "moved" is either a sort that
-    // happened mid-run (fine, once) or a column that changes on its own and
-    // will defer the same rows every run, each after paying for its API call.
-    // Name the columns so the Log sheet explains itself either way.
-    var movedWarning = buildMovedRowWarning_(movedRows, stats.total, changedColCounts, headers);
+    // A run that deferred most of the rows it reached as "moved" is either a
+    // sort that happened mid-run (fine, once) or a column that changes on its
+    // own and will defer the same rows every run, each after paying for its
+    // API call. Name the columns so the Log sheet explains itself either way.
+    var movedWarning = buildMovedRowWarning_(movedRows, reachedRows, changedColCounts, headers,
+      stats.total - reachedRows);
     if (movedWarning) Logger.log('WARNING: ' + movedWarning);
 
     // Best-effort run summary. Grades are already persisted per-row, so a Log
@@ -802,15 +810,18 @@ function rowMatchesSnapshot_(snapshot, current, snapFormulas, curFormulas, skipC
 
 /**
  * The most-rows-deferred warning, or '' when there is nothing to warn about:
- * `moved` rows out of `total` were skipped as moved/changed, and that is more
- * than GRADER_CONFIG.MOVED_ROW_WARN_RATIO of the run. `colCounts` maps a
- * 0-based column index (-1 for "the row's width changed") to how many of those
- * rows differed there; the columns are named from `headers`, most frequent
- * first. Pure, so the harness can pin the wording the Log sheet shows.
+ * `moved` rows out of the `reached` rows the run handed to gradeOneRow_ were
+ * skipped as moved/changed, and that is more than
+ * GRADER_CONFIG.MOVED_ROW_WARN_RATIO of them. `reached` is not the backlog
+ * size: rows the timer budget (or a fatal stop) never got to are passed as
+ * `notReached` (optional) and only mentioned, never counted. `colCounts` maps
+ * a 0-based column index (-1 for "the row's width changed") to how many of
+ * those rows differed there; the columns are named from `headers`, most
+ * frequent first. Pure, so the harness can pin the wording the Log sheet shows.
  */
-function buildMovedRowWarning_(moved, total, colCounts, headers) {
+function buildMovedRowWarning_(moved, reached, colCounts, headers, notReached) {
   var ratio = Number(GRADER_CONFIG.MOVED_ROW_WARN_RATIO);
-  if (!moved || !total || isNaN(ratio) || !(moved > total * ratio)) return '';
+  if (!moved || !reached || isNaN(ratio) || !(moved > reached * ratio)) return '';
   var keys = [];
   for (var k in colCounts) if (colCounts.hasOwnProperty(k)) keys.push(k);
   keys.sort(function (a, b) { return (colCounts[b] - colCounts[a]) || (Number(a) - Number(b)); });
@@ -822,7 +833,9 @@ function buildMovedRowWarning_(moved, total, colCounts, headers) {
     var label = idx < 0 ? 'row width' : (header || ('column ' + (idx + 1)));
     parts.push(label + ' (' + colCounts[keys[i]] + ')');
   }
-  return moved + ' of ' + total + ' rows were deferred because they moved or changed mid-run. ' +
+  return moved + ' of ' + reached + ' rows' + (notReached > 0 ? ' this run reached' : '') +
+    ' were deferred because they moved or changed mid-run' +
+    (notReached > 0 ? ' (' + notReached + ' more were not reached)' : '') + '. ' +
     'Columns that differed: ' + (parts.length ? parts.join(', ') : 'none recorded') + '. ' +
     'One sort or edit during a run is normal. If the same column is named run after run, ' +
     'it changes on its own (a formula recalculating through a helper cell?): put the ' +

@@ -10,7 +10,8 @@
  * The pure helpers are tested directly. The last section also runs
  * gradeNewRows() end to end against in-memory stand-ins for SpreadsheetApp /
  * UrlFetchApp / PropertiesService / LockService, which is what covers the
- * failure paths (rejected key, retired model, a row that moved mid-run). Real
+ * failure paths (rejected key, retired model, a row that moved mid-run, a
+ * backlog that outlasts the timer budget on a fake clock). Real
  * Sheets and network behavior still only run bound to a real spreadsheet.
  */
 'use strict';
@@ -335,6 +336,18 @@ check('one of one deferred warns', /^1 of 1 rows/.test(buildMovedRowWarning_(1, 
 })();
 check('a width change is named as such', buildMovedRowWarning_(2, 2, { '-1': 2 }, WH).indexOf('row width (2)') !== -1);
 check('a column with no header is named by number', buildMovedRowWarning_(2, 2, { 6: 2 }, WH).indexOf('column 7 (2)') !== -1);
+// The share is of the rows the run reached, not of the whole backlog: rows the
+// timer never got to are mentioned, never counted (2026-11-06 audit).
+(function () {
+  var w = buildMovedRowWarning_(35, 35, { 5: 35 }, WH, 165);
+  check('every reached row deferred on a 200-row backlog warns', /^35 of 35 rows this run reached were deferred/.test(w));
+  check('the warning says how many rows were not reached', w.indexOf('(165 more were not reached)') !== -1);
+  check('just over half of the reached rows warns', buildMovedRowWarning_(20, 39, { 5: 20 }, WH, 161) !== '');
+  check('just under half of the reached rows does not', buildMovedRowWarning_(19, 39, { 5: 19 }, WH, 161) === '');
+  check('with every row reached the wording does not mention reach',
+    buildMovedRowWarning_(2, 3, { 5: 2 }, WH, 0).indexOf('reached') === -1 &&
+    buildMovedRowWarning_(2, 3, { 5: 2 }, WH).indexOf('reached') === -1);
+})();
 (function () {
   var saved = sandbox.GRADER_CONFIG.MOVED_ROW_WARN_RATIO;
   sandbox.GRADER_CONFIG.MOVED_ROW_WARN_RATIO = 2;
@@ -421,6 +434,8 @@ FakeSheet.prototype.setFrozenRows = function () {};
 FakeSheet.prototype.setColumnWidth = function () {};
 
 var cfg = sandbox.GRADER_CONFIG;
+// The sandbox's own Date, kept so a fake-clock scenario can put it back.
+var CtxDate = vm.runInContext('Date', sandbox);
 var HEADERS = ['title', 'body', 'status', 'grade', 'reasoning'];
 function dataGrid() {
   return [
@@ -436,6 +451,8 @@ function singleRowGrid() {
 // Installs the Apps Script globals for one scenario and runs gradeNewRows.
 // `respond(callNumber, sheets)` returns { code, body } for each fetch.
 // `formulas` (optional) marks Data cells as formula-backed, see FakeSheet.
+// `fakeClock` (optional) makes Utilities.sleep advance the clock Grader.js
+// reads instead of doing nothing, so a long backlog really hits TIMER_BUDGET_SEC.
 function runScenario(opts) {
   var sheets = {};
   sheets[cfg.DATA_SHEET] = new FakeSheet(opts.data || dataGrid(), opts.formulas);
@@ -462,7 +479,14 @@ function runScenario(opts) {
   } };
   logLines.length = 0;
   var threw = null;
+  var sleptMs = 0;
+  var realSleep = sandbox.Utilities.sleep;
+  if (opts.fakeClock) {
+    sandbox.Utilities.sleep = function (ms) { sleptMs += ms; };
+    sandbox.Date = function () { return new CtxDate(CtxDate.now() + sleptMs); };
+  }
   try { gradeNewRows(); } catch (e) { threw = e; }
+  finally { sandbox.Utilities.sleep = realSleep; sandbox.Date = CtxDate; }
   var log = sheets[cfg.LOG_SHEET];
   return {
     threw: threw, calls: calls, data: sheets[cfg.DATA_SHEET].grid,
@@ -769,6 +793,52 @@ function ok200(content) {
   check('indirect volatile spill: notes name the age column',
     /^2 of 3 rows/.test(r.logNotes) && r.logNotes.indexOf('age (2)') !== -1 && r.logNotes.indexOf('title') === -1);
   check('indirect volatile spill: WARNING logged', logLines.some(function (l) { return l.indexOf('WARNING: 2 of 3 rows') !== -1; }));
+})();
+
+// A backlog longer than one run can reach. The pacing sleep advances a fake
+// clock, so the run stops at the timer budget with most rows never attempted.
+(function () {
+  var TOTAL = 200;
+  // Row 1 starts at 0s; each later row first waits out API_DELAY_MS.
+  var reached = Math.floor(cfg.TIMER_BUDGET_SEC * 1000 / cfg.API_DELAY_MS) + 1;
+  var notReached = TOTAL - reached;
+  check('timer scenario: the backlog outlasts one run', reached > 2 && notReached > reached);
+
+  // The indirect spill again: every reached row after the first is deferred as
+  // moved. Measured against the whole backlog that is well under half and the
+  // note stayed blank for a hundred-odd runs; measured against the rows the
+  // run reached it is nearly all of them (2026-11-06 audit).
+  var H = HEADERS.concat(['age']);
+  var data = [H];
+  for (var i = 0; i < TOTAL; i++) data.push(['Row ' + i, 'b', 'new', '', '', 1]);
+  var formulas = [[], ['', '', '', '', '', '=ARRAYFORMULA($H$1-E2:E)']];
+  var r = runScenario({ fakeClock: true, data: data, formulas: formulas, respond: function (n, sheets) {
+    var g = sheets[cfg.DATA_SHEET].grid;
+    for (var j = 1; j < g.length; j++) g[j][5] += 1;  // recalculation via the helper cell
+    return ok200('GRADE: B\nREASONING: Fine.');
+  } });
+  var moved = reached - 1;
+  check('timer + indirect spill: does not throw', r.threw === null);
+  eq('timer + indirect spill: one API call per reached row', r.calls, reached);
+  eq('timer + indirect spill: one graded, everything else deferred', r.logRow, [TOTAL, 1, 0, 0, TOTAL - 1]);
+  check('timer + indirect spill: notes warn against the rows reached, not the backlog',
+    typeof r.logNotes === 'string' &&
+    r.logNotes.indexOf(moved + ' of ' + reached + ' rows this run reached were deferred') === 0 &&
+    r.logNotes.indexOf('(' + notReached + ' more were not reached)') !== -1 &&
+    r.logNotes.indexOf('age (' + moved + ')') !== -1);
+  check('timer + indirect spill: timer stop logged',
+    logLines.some(function (l) { return l.indexOf('Hit timer budget') !== -1; }));
+
+  // The same backlog with nothing moving: the timer defers most rows, and that
+  // alone must never read as "rows moved" -- no note, no WARNING.
+  var plain = [HEADERS.slice()];
+  for (var k = 0; k < TOTAL; k++) plain.push(['Row ' + k, 'b', 'new', '', '']);
+  var r2 = runScenario({ fakeClock: true, data: plain, respond: function () { return ok200('GRADE: B\nREASONING: Fine.'); } });
+  check('timer + ordinary backlog: does not throw', r2.threw === null);
+  eq('timer + ordinary backlog: reached rows graded, the rest deferred', r2.logRow, [TOTAL, reached, 0, 0, notReached]);
+  check('timer + ordinary backlog: notes stay blank', !r2.logNotes);
+  check('timer + ordinary backlog: no deferral WARNING logged',
+    !logLines.some(function (l) { return l.indexOf('were deferred because they moved') !== -1; }));
 })();
 
 // --- placeholder sentinel regression guard ---------------------------------

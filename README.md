@@ -103,7 +103,8 @@ A few details worth knowing:
   `RANDARRAY`) the cells it spills into aren't compared at all; the row's plain
   columns still catch a sort. What this can't see is a change in a formula's
   *inputs* (an edit on the tab a `=VLOOKUP` reads from) while a run is in
-  progress. If more than half of a run's rows are deferred this way, the run
+  progress. If more than half of the rows a run reached are deferred this way
+  (rows left over when the run hit its time limit don't count), the run
   writes a warning to the Log sheet's `notes` column naming the columns that
   differed: one sort during a run is normal, but the same column named run
   after run means it changes on its own (a formula that recalculates through a
@@ -266,8 +267,11 @@ without opening the execution log. Disable with `ENABLE_RUN_LOG: false`. (A Log
 sheet created before the `notes` column existed gets its header relabeled on the
 next run.)
 
-`notes` is blank unless the run deferred more than half of its rows because
-they moved or changed mid-run (`MOVED_ROW_WARN_RATIO`). Then it names the
+`notes` is blank unless the run deferred more than half of the rows it reached
+because they moved or changed mid-run (`MOVED_ROW_WARN_RATIO`). Rows the timer
+budget never got to are left out of that share, so a long backlog can't hide
+the problem; the note mentions them instead (`38 of 39 rows this run reached
+were deferred … (161 more were not reached)`). It names the
 columns that differed, most frequent first — `2 of 3 rows were deferred …
 Columns that differed: age (2)` — so a sheet that keeps deferring the same rows
 explains itself in the sheet. A sort during one run is normal and the note
@@ -335,7 +339,7 @@ header, or status is matched case-insensitively.
 | `VOLATILE_FUNCTIONS` | `NOW`, `TODAY`, `RAND`, `RANDBETWEEN`, `RANDARRAY` | Spreadsheet functions that recalculate on every edit. A column whose formula names one of them (an `=ARRAYFORMULA(NOW()-…)` filling the column from its top cell) has its formula-less cells left out of the moved-row check, so each grade written doesn't make the rows below it look moved. |
 | `MAX_FIELD_CHARS` | `600` | Per-field truncation in the prompt. Raise it if your rows have important long-form content. |
 | `ENABLE_RUN_LOG` | `true` | Append a per-run summary to the `Log` sheet. |
-| `MOVED_ROW_WARN_RATIO` | `0.5` | When more than this share of a run's rows are deferred as moved or changed mid-run, log a warning naming the columns that differed and write it to the Log sheet's `notes` column. Set above `1` to turn it off. |
+| `MOVED_ROW_WARN_RATIO` | `0.5` | When more than this share of the rows a run reached (not counting rows left for the next run by the timer budget) are deferred as moved or changed mid-run, log a warning naming the columns that differed and write it to the Log sheet's `notes` column. Set above `1` to turn it off. |
 
 **Statuses and grades**
 
@@ -386,7 +390,8 @@ transient provider blip, a non-JSON `200`, a row that moves mid-run, a volatile
 formula column, formula-backed content columns sorted mid-run, and a volatile
 `ARRAYFORMULA` column filled from its top cell or its header cell (with and
 without a sort), an indirectly volatile column that trips the deferral warning,
-and a Log sheet from before the `notes` column. Real
+a 200-row backlog that outlasts the timer budget on a fake clock (with that
+column and without), and a Log sheet from before the `notes` column. Real
 Sheets and network behavior still only run bound to a real spreadsheet.
 
 ## License
