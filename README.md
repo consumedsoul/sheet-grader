@@ -278,8 +278,12 @@ Columns that differed: age (2)` — so a sheet that keeps deferring the same row
 explains itself in the sheet. A sort during one run is normal and the note
 appears once; the same column every run means it recalculates on its own
 through something `VOLATILE_FUNCTIONS` can't see by name (a helper cell holding
-`=NOW()`), and the fix is to name the volatile function in that column's own
-formula.
+`=NOW()`). There are two fixes, and the note names both: write the volatile
+function into that column's own formula (`=ARRAYFORMULA(NOW()-E2:E)` rather
+than `=ARRAYFORMULA($H$1-E2:E)`), or add a function that formula does use
+(`ARRAYFORMULA`) to `VOLATILE_FUNCTIONS`, which leaves every column filled by
+one out of the moved-row check. Adding `NOW` again does nothing, because only
+the column's own formula text is read.
 
 A run that dies outright — no API key, a blank `criteria_text` on an existing
 Criteria sheet, missing or duplicated required columns, an unhandled exception —
@@ -337,7 +341,7 @@ header, or status is matched case-insensitively.
 | `TITLE_COLUMNS` | `['title', 'name']` | Which column counts as a row's title for `title:` exclude keywords (first non-empty wins). |
 | `CRITERIA_KEY_HEADER` / `CRITERIA_VALUE_HEADER` | `field` / `value` | Criteria sheet column headers. |
 | `SKIP_COLUMNS_IN_PROMPT` | `status`, `grade`, `reasoning`, `id`, `scraped_at`, `graded_at` | Columns never sent to the LLM or checked by exclude keywords. Add anything you don't want leaving the sheet. |
-| `VOLATILE_FUNCTIONS` | `NOW`, `TODAY`, `RAND`, `RANDBETWEEN`, `RANDARRAY` | Spreadsheet functions that recalculate on every edit. A column whose formula names one of them (an `=ARRAYFORMULA(NOW()-…)` filling the column from its top cell) has its formula-less cells left out of the moved-row check, so each grade written doesn't make the rows below it look moved. |
+| `VOLATILE_FUNCTIONS` | `NOW`, `TODAY`, `RAND`, `RANDBETWEEN`, `RANDARRAY` | Spreadsheet functions that recalculate on every edit. A column whose formula names one of them (an `=ARRAYFORMULA(NOW()-…)` filling the column from its top cell) has its formula-less cells left out of the moved-row check, so each grade written doesn't make the rows below it look moved. Only the column's own formula text is read, so for a column that is volatile through a helper cell (`=ARRAYFORMULA($H$1-E2:E)`, `H1` holding `=NOW()`) add `ARRAYFORMULA` itself. |
 | `MAX_FIELD_CHARS` | `600` | Per-field truncation in the prompt. Raise it if your rows have important long-form content. |
 | `ENABLE_RUN_LOG` | `true` | Append a per-run summary to the `Log` sheet. |
 | `MOVED_ROW_WARN_RATIO` | `0.5` | When more than this share of the rows a run reached (not counting rows left for the next run by the timer budget) are deferred as moved or changed mid-run, log a warning naming the columns that differed and write it to the Log sheet's `notes` column. Set above `1` to turn it off. |
@@ -391,6 +395,7 @@ transient provider blip, a non-JSON `200`, a row that moves mid-run, a volatile
 formula column, formula-backed content columns sorted mid-run, and a volatile
 `ARRAYFORMULA` column filled from its top cell or its header cell (with and
 without a sort), an indirectly volatile column that trips the deferral warning,
+that column again with `ARRAYFORMULA` added to `VOLATILE_FUNCTIONS`,
 a 200-row backlog on a fake clock (outlasting the timer budget with rows
 edited mid-call and with nothing moving, and skipped for one API call with
 that column), and a Log sheet from before the `notes` column. Real

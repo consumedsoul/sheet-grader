@@ -106,6 +106,11 @@ var GRADER_CONFIG = {
   // those spilled cells carry no formula text of their own. The moved-row guard
   // therefore does not value-compare the formula-less cells of such a column;
   // the row's plain columns still catch a sort. Matched case-insensitively.
+  // Only the column's own formula text is read: a column that is volatile
+  // through a helper cell (=ARRAYFORMULA($H$1-E2:E) with H1 holding =NOW())
+  // names none of these, and adding NOW again changes nothing. For that, list
+  // a function its formula does name (ARRAYFORMULA), which exempts the spill
+  // of every column filled by one.
   VOLATILE_FUNCTIONS: ['NOW', 'TODAY', 'RAND', 'RANDBETWEEN', 'RANDARRAY'],
 
   // Columns to skip when building the prompt (already metadata, not content
@@ -852,8 +857,10 @@ function buildMovedRowWarning_(moved, reached, colCounts, headers, notReached) {
     (notReached > 0 ? ' (' + notReached + ' more were not reached)' : '') + '. ' +
     'Columns that differed: ' + (parts.length ? parts.join(', ') : 'none recorded') + '. ' +
     'One sort or edit during a run is normal. If the same column is named run after run, ' +
-    'it changes on its own (a formula recalculating through a helper cell?): put the ' +
-    'volatile function in that column\'s own formula, or add it to VOLATILE_FUNCTIONS.';
+    'it changes on its own (a formula recalculating through a helper cell?). Either write ' +
+    'the volatile function into that column\'s own formula (NOW() itself, not a cell holding ' +
+    '=NOW()), or add a function that formula does use (ARRAYFORMULA, say) to ' +
+    'VOLATILE_FUNCTIONS; every column filled by one is then left out of the moved-row check.';
 }
 
 /**

@@ -54,7 +54,8 @@ directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/f
 (happy path, rejected key, retired model, transient blip, non-JSON 200, row moved mid-run,
 volatile formula column, formula-backed rows sorted mid-run, volatile `ARRAYFORMULA`
 spill column anchored in row 2 or in the header cell, each with and without a sort,
-an indirectly volatile spill that trips the most-rows-deferred warning, a 200-row
+an indirectly volatile spill that trips the most-rows-deferred warning, the same spill
+with `ARRAYFORMULA` added to `VOLATILE_FUNCTIONS` as the warning advises, a 200-row
 backlog on a fake clock — outlasting the timer budget with rows edited mid-call and
 with nothing moving, and skipped for one API call with that spill —
 and a Log sheet from before the `notes` column). Run it after touching
@@ -190,7 +191,9 @@ anything; add a scenario there when touching the loop or a failure path.
   through the row's other columns; a sheet whose *every* content column is such a spill
   has no moved-row protection. A spill whose volatility is *indirect*
   (`=ARRAYFORMULA($H$1-E2:E)` with `H1` holding `=NOW()`) names no volatile function
-  and still defers every row after the first; name matching can't close that. Those
+  and still defers every row after the first; matching on the volatile function's name
+  can't close that. The user can, by listing a function the column's formula does name
+  (`ARRAYFORMULA`) in `VOLATILE_FUNCTIONS`, which exempts every such column's spill. Those
   rows are caught by the check before the API call, so they cost a sheet read each, not
   a call (2026-11-06 audit), but the backlog still only shrinks by one row a run. What
   the run does about that is say so: when more than `MOVED_ROW_WARN_RATIO` of the rows it
@@ -217,12 +220,12 @@ anything; add a scenario there when touching the loop or a failure path.
 - Changing `findRowChanges_` / `getUngradedRows_`? Keep `_formulas` in step with
   `_snapshot` (same width, read from the same range), and compare formula cells by text,
   never by value and never by skipping them — a volatile formula column otherwise defers
-  every row after paying for its API call, and skipping them outright put grades on the
+  every row, and skipping them outright put grades on the
   wrong rows when every content column was a formula (2026-10-16 audit). The one
   skip that is allowed is per *column*, not per cell: formula-less cells in a column
   that `findVolatileColumns_` flagged (a volatile `ARRAYFORMULA` holds its text in the
   top cell only, and its spill changes value on every write) — otherwise one such
-  column deferred every row after the first, each after paying for its call
+  column deferred every row after the first
   (2026-10-23 audit). Keep that detection reading the *whole* range plus the header
   row, not just the gradable rows: the anchor sits in row 2, which is usually already
   graded, or in row 1 when written as `={"age"; ARRAYFORMULA(…)}` in the header cell
@@ -246,6 +249,10 @@ anything; add a scenario there when touching the loop or a failure path.
   case-insensitive regex built in `findVolatileColumns_`, so it needs no normalizing.)
 - `title:` keywords match only `findRowTitle_` (the `TITLE_COLUMNS`). Keep
   `guessRowTitle_`'s fallback-to-any-column behavior out of matching — it's for logs.
+- Changing the text of `buildMovedRowWarning_`? Every fix it names must work for the
+  indirect spill it describes. "Add it to VOLATILE_FUNCTIONS" shipped meaning the
+  volatile function, which `findVolatileColumns_` can never see in that column's
+  formula (2026-11-13 audit); the harness now runs the advice end to end.
 - Changing `updateRowGrade_`? It takes a `cols` object (`{ gradeCol, reasoningCol,
   statusCol }`), not three separate args.
 - Changing which rows a run picks up? Edit `STATUSES_TO_GRADE` (currently `new` +

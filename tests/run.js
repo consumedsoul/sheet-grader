@@ -333,6 +333,9 @@ check('one of one deferred warns', /^1 of 1 rows/.test(buildMovedRowWarning_(1, 
   var w = buildMovedRowWarning_(3, 4, { 5: 3, 0: 1 }, WH);
   check('warning names the columns most-frequent first with counts', w.indexOf('age (3), title (1)') !== -1);
   check('warning points at VOLATILE_FUNCTIONS', w.indexOf('VOLATILE_FUNCTIONS') !== -1);
+  // The entry it suggests has to be one that works for a helper-cell column,
+  // whose own formula names only ARRAYFORMULA (see findVolatileColumns_ below).
+  check('warning names a VOLATILE_FUNCTIONS entry that fixes a helper-cell column', w.indexOf('ARRAYFORMULA') !== -1);
 })();
 check('a width change is named as such', buildMovedRowWarning_(2, 2, { '-1': 2 }, WH).indexOf('row width (2)') !== -1);
 check('a column with no header is named by number', buildMovedRowWarning_(2, 2, { 6: 2 }, WH).indexOf('column 7 (2)') !== -1);
@@ -365,6 +368,21 @@ eq('per-row volatile formulas flag their column too',
   findVolatileColumns_([['', '', '=TODAY()-F2'], ['', '', '=today()-F3']], 3), [false, false, true]);
 eq('a non-volatile formula column is not flagged',
   findVolatileColumns_([['=Src!A2', '=ARRAYFORMULA(Src!B2:B)'], ['=Src!A3', '']], 2), [false, false]);
+// The indirect spill: volatile through a helper cell, so its own formula names
+// no volatile function. Listing the volatile function again can't flag it;
+// listing the function the formula does name can, which is what the deferral
+// warning tells the user to do (2026-11-13 audit).
+(function () {
+  var indirect = [['', '=ARRAYFORMULA($H$1-E2:E)'], ['', '']];
+  var gc = sandbox.GRADER_CONFIG;
+  var saved = gc.VOLATILE_FUNCTIONS;
+  eq('a helper-cell spill is not flagged by default', findVolatileColumns_(indirect, 2), [false, false]);
+  gc.VOLATILE_FUNCTIONS = saved.concat(['NOW', 'MYCLOCK']);
+  eq('naming the volatile function again does not flag a helper-cell spill', findVolatileColumns_(indirect, 2), [false, false]);
+  gc.VOLATILE_FUNCTIONS = saved.concat(['ARRAYFORMULA']);
+  eq('listing ARRAYFORMULA flags a helper-cell spill', findVolatileColumns_(indirect, 2), [false, true]);
+  gc.VOLATILE_FUNCTIONS = saved;
+})();
 eq('a function whose name merely ends in a volatile name is not flagged',
   findVolatileColumns_([['=KNOWN(A2)', '=RANDOMIZE(B2)']], 2), [false, false]);
 eq('the anchor row may be below a graded row (whole range is scanned)',
@@ -796,6 +814,39 @@ function ok200(content) {
   check('indirect volatile spill: notes name the age column',
     /^2 of 3 rows/.test(r.logNotes) && r.logNotes.indexOf('age (2)') !== -1 && r.logNotes.indexOf('title') === -1);
   check('indirect volatile spill: WARNING logged', logLines.some(function (l) { return l.indexOf('WARNING: 2 of 3 rows') !== -1; }));
+})();
+
+// The same indirect spill after following the warning's advice: ARRAYFORMULA
+// added to VOLATILE_FUNCTIONS. Every row now grades in one run, and a real
+// sort is still caught through the row's plain columns.
+(function () {
+  var H = HEADERS.concat(['age']);
+  function grid() { return [H.slice(), ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1], ['Three', 'c', 'new', '', '', 1]]; }
+  function fx() { return [[], ['', '', '', '', '', '=ARRAYFORMULA($H$1-E2:E)'], [], []]; }
+  function tick(sheets) {
+    var g = sheets[cfg.DATA_SHEET].grid;
+    for (var i = 1; i < g.length; i++) g[i][5] += 1;  // recalculation via the helper cell
+  }
+  var saved = cfg.VOLATILE_FUNCTIONS;
+  cfg.VOLATILE_FUNCTIONS = saved.concat(['ARRAYFORMULA']);
+  try {
+    var r = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+      tick(sheets);
+      return ok200('GRADE: B\nREASONING: Fine.');
+    } });
+    check('indirect spill + ARRAYFORMULA listed: does not throw', r.threw === null);
+    eq('indirect spill + ARRAYFORMULA listed: all rows graded, none deferred', r.logRow, [3, 3, 0, 0, 0]);
+    check('indirect spill + ARRAYFORMULA listed: no note', !r.logNotes);
+
+    var r2 = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+      tick(sheets);
+      if (n === 1) sheets[cfg.DATA_SHEET].swapRows(3, 4);  // one sort, during the first row's API call
+      return ok200('GRADE: B\nREASONING: Fine.');
+    } });
+    eq('indirect spill + ARRAYFORMULA listed + real sort: row 2 graded, the swapped pair deferred', r2.logRow, [3, 1, 0, 0, 2]);
+    check('indirect spill + ARRAYFORMULA listed + real sort: no grade on the swapped rows',
+      r2.data[2][3] === '' && r2.data[3][3] === '');
+  } finally { cfg.VOLATILE_FUNCTIONS = saved; }
 })();
 
 // A backlog longer than one run can reach. The pacing sleep advances a fake
