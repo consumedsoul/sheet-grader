@@ -47,6 +47,7 @@ var buildGradingPrompt_ = sandbox.buildGradingPrompt_;
 var rowMatchesSnapshot_ = sandbox.rowMatchesSnapshot_;
 var findVolatileColumns_ = sandbox.findVolatileColumns_;
 var findChangedColumns_ = sandbox.findChangedColumns_;
+var findMoveCheckSkipColumns_ = sandbox.findMoveCheckSkipColumns_;
 var buildMovedRowWarning_ = sandbox.buildMovedRowWarning_;
 var gradeNewRows = sandbox.gradeNewRows;
 var RUN_LOG_HEADERS = sandbox.RUN_LOG_HEADERS;
@@ -226,6 +227,11 @@ check('null/undefined cell does not throw', isGradableStatus_(null) === false &&
   check('a capitalized SKIP_COLUMNS_IN_PROMPT entry keeps that column out of the prompt',
     buildGradingPrompt_('rubric', { notes: 'SECRET', body: 'B', _row: 2 }).indexOf('SECRET') === -1);
   sandbox.GRADER_CONFIG.SKIP_COLUMNS_IN_PROMPT = original;
+
+  var c2 = { MOVE_CHECK_SKIP_COLUMNS: [' Age ', ''] };
+  normalizeConfig_(c2);
+  eq('normalizeConfig_ lowercases + trims MOVE_CHECK_SKIP_COLUMNS', c2.MOVE_CHECK_SKIP_COLUMNS, ['age']);
+  eq('MOVE_CHECK_SKIP_COLUMNS ships empty', sandbox.GRADER_CONFIG.MOVE_CHECK_SKIP_COLUMNS, []);
 })();
 
 // --- parseCriteriaValues_ (header-named Criteria sheet read) ---------------
@@ -332,10 +338,12 @@ check('one of one deferred warns', /^1 of 1 rows/.test(buildMovedRowWarning_(1, 
 (function () {
   var w = buildMovedRowWarning_(3, 4, { 5: 3, 0: 1 }, WH);
   check('warning names the columns most-frequent first with counts', w.indexOf('age (3), title (1)') !== -1);
-  check('warning points at VOLATILE_FUNCTIONS', w.indexOf('VOLATILE_FUNCTIONS') !== -1);
-  // The entry it suggests has to be one that works for a helper-cell column,
-  // whose own formula names only ARRAYFORMULA (see findVolatileColumns_ below).
-  check('warning names a VOLATILE_FUNCTIONS entry that fixes a helper-cell column', w.indexOf('ARRAYFORMULA') !== -1);
+  // Every fix the note names has to work for a helper-cell column, whose own
+  // formula names no volatile function. Listing the column by header does
+  // (run end to end below); "add it to VOLATILE_FUNCTIONS" did not and must
+  // not come back as advice (2026-11-13 audit).
+  check('warning points at MOVE_CHECK_SKIP_COLUMNS', w.indexOf('MOVE_CHECK_SKIP_COLUMNS') !== -1);
+  check('warning does not send the user to VOLATILE_FUNCTIONS', w.indexOf('VOLATILE_FUNCTIONS') === -1);
 })();
 check('a width change is named as such', buildMovedRowWarning_(2, 2, { '-1': 2 }, WH).indexOf('row width (2)') !== -1);
 check('a column with no header is named by number', buildMovedRowWarning_(2, 2, { 6: 2 }, WH).indexOf('column 7 (2)') !== -1);
@@ -356,6 +364,20 @@ check('a column with no header is named by number', buildMovedRowWarning_(2, 2, 
   sandbox.GRADER_CONFIG.MOVED_ROW_WARN_RATIO = 2;
   check('a ratio above 1 disables the warning', buildMovedRowWarning_(3, 3, { 0: 3 }, WH) === '');
   sandbox.GRADER_CONFIG.MOVED_ROW_WARN_RATIO = saved;
+})();
+
+// --- findMoveCheckSkipColumns_ (columns exempted by header name) ------------
+(function () {
+  var gc = sandbox.GRADER_CONFIG;
+  var saved = gc.MOVE_CHECK_SKIP_COLUMNS;
+  var r0 = findMoveCheckSkipColumns_(['title', 'age']);
+  eq('nothing listed: no column exempt, nothing unmatched', [r0.flags, r0.unmatched], [[false, false], []]);
+  gc.MOVE_CHECK_SKIP_COLUMNS = ['age', 'nope'];
+  var r1 = findMoveCheckSkipColumns_(['Title', ' Age ', '', 'age']);
+  eq('a listed header is flagged whatever its case or padding, in every column carrying it',
+    r1.flags, [false, true, false, true]);
+  eq('a listed name that matches no header is reported', r1.unmatched, ['nope']);
+  gc.MOVE_CHECK_SKIP_COLUMNS = saved;
 })();
 
 // --- findVolatileColumns_ (per-column volatile detection) -------------------
@@ -847,6 +869,53 @@ function ok200(content) {
     check('indirect spill + ARRAYFORMULA listed + real sort: no grade on the swapped rows',
       r2.data[2][3] === '' && r2.data[3][3] === '');
   } finally { cfg.VOLATILE_FUNCTIONS = saved; }
+})();
+
+// The indirect spill fixed the way the warning now says to: its header listed
+// in MOVE_CHECK_SKIP_COLUMNS. Only that column is exempt, so every row grades
+// in one run, a real sort is still caught through the plain columns, and an
+// edit to a column that is not listed still defers its row.
+(function () {
+  var H = HEADERS.concat(['Age']);
+  function grid() { return [H.slice(), ['One', 'a', 'new', '', '', 1], ['Two', 'b', 'new', '', '', 1], ['Three', 'c', 'new', '', '', 1]]; }
+  function fx() { return [[], ['', '', '', '', '', '=ARRAYFORMULA($H$1-E2:E)'], [], []]; }
+  function tick(sheets) {
+    var g = sheets[cfg.DATA_SHEET].grid;
+    for (var i = 1; i < g.length; i++) g[i][5] += 1;  // recalculation via the helper cell
+  }
+  var saved = cfg.MOVE_CHECK_SKIP_COLUMNS;
+  cfg.MOVE_CHECK_SKIP_COLUMNS = ['AGE', 'Agee'];  // as a user would type it, plus a typo
+  normalizeConfig_(cfg);
+  try {
+    var r = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+      tick(sheets);
+      return ok200('GRADE: B\nREASONING: Fine.');
+    } });
+    check('indirect spill + header listed: does not throw', r.threw === null);
+    eq('indirect spill + header listed: all rows graded, none deferred', r.logRow, [3, 3, 0, 0, 0]);
+    eq('indirect spill + header listed: one API call per row', r.calls, 3);
+    check('indirect spill + header listed: no note', !r.logNotes);
+    check('a MOVE_CHECK_SKIP_COLUMNS entry that matches no header is logged, not silently ignored',
+      logLines.some(function (l) { return l.indexOf('WARNING: MOVE_CHECK_SKIP_COLUMNS names "agee"') !== -1; }) &&
+      !logLines.some(function (l) { return l.indexOf('MOVE_CHECK_SKIP_COLUMNS names "age"') !== -1; }));
+
+    var r2 = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+      tick(sheets);
+      if (n === 1) sheets[cfg.DATA_SHEET].swapRows(3, 4);  // one sort, during the first row's API call
+      return ok200('GRADE: B\nREASONING: Fine.');
+    } });
+    eq('indirect spill + header listed + real sort: row 2 graded, the swapped pair deferred', r2.logRow, [3, 1, 0, 0, 2]);
+    check('indirect spill + header listed + real sort: no grade on the swapped rows',
+      r2.data[2][3] === '' && r2.data[3][3] === '');
+
+    var r3 = runScenario({ data: grid(), formulas: fx(), respond: function (n, sheets) {
+      tick(sheets);
+      if (n === 1) sheets[cfg.DATA_SHEET].grid[2][1] = 'edited';  // row 3's body, not a listed column
+      return ok200('GRADE: B\nREASONING: Fine.');
+    } });
+    eq('indirect spill + header listed: an edit to an unlisted column still defers that row', r3.logRow, [3, 2, 0, 0, 1]);
+    check('indirect spill + header listed: the edited row got no grade', r3.data[2][3] === '');
+  } finally { cfg.MOVE_CHECK_SKIP_COLUMNS = saved; }
 })();
 
 // A backlog longer than one run can reach. The pacing sleep advances a fake

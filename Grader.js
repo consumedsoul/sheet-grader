@@ -108,10 +108,22 @@ var GRADER_CONFIG = {
   // the row's plain columns still catch a sort. Matched case-insensitively.
   // Only the column's own formula text is read: a column that is volatile
   // through a helper cell (=ARRAYFORMULA($H$1-E2:E) with H1 holding =NOW())
-  // names none of these, and adding NOW again changes nothing. For that, list
-  // a function its formula does name (ARRAYFORMULA), which exempts the spill
-  // of every column filled by one.
+  // names none of these, and adding NOW again changes nothing. For that, name
+  // the column in MOVE_CHECK_SKIP_COLUMNS below (or list a function its
+  // formula does name, ARRAYFORMULA, which exempts the spill of every column
+  // filled by one).
   VOLATILE_FUNCTIONS: ['NOW', 'TODAY', 'RAND', 'RANDBETWEEN', 'RANDARRAY'],
+
+  // Data-sheet headers to leave out of the moved-row check, for a column that
+  // changes on its own in a way VOLATILE_FUNCTIONS can't see (the helper-cell
+  // case above, or a column another script keeps rewriting). The deferral
+  // warning in the Log sheet names the column; put that header here, e.g.
+  // ['age']. Only the listed column is exempt, and only its formula-less
+  // cells: a cell with its own formula is still compared by formula text, and
+  // the row's other columns still catch a sort -- so don't list every content
+  // column. Matched case-insensitively (see normalizeConfig_); an entry that
+  // matches no header is logged as a WARNING and ignored.
+  MOVE_CHECK_SKIP_COLUMNS: [],
 
   // Columns to skip when building the prompt (already metadata, not content
   // worth grading). Matched case-insensitively (see normalizeConfig_).
@@ -151,7 +163,7 @@ function normalizeConfig_(cfg) {
   var scalars = ['STATUS_COLUMN', 'GRADE_COLUMN', 'REASONING_COLUMN',
     'CRITERIA_KEY_HEADER', 'CRITERIA_VALUE_HEADER'];
   for (var i = 0; i < scalars.length; i++) cfg[scalars[i]] = norm(cfg[scalars[i]]);
-  var lists = ['SKIP_COLUMNS_IN_PROMPT', 'TITLE_COLUMNS', 'STATUSES_TO_GRADE'];
+  var lists = ['SKIP_COLUMNS_IN_PROMPT', 'TITLE_COLUMNS', 'STATUSES_TO_GRADE', 'MOVE_CHECK_SKIP_COLUMNS'];
   for (var j = 0; j < lists.length; j++) {
     var out = [];
     var src = cfg[lists[j]] || [];
@@ -688,8 +700,9 @@ function isGradableStatus_(rawStatus) {
  * values read here, which findRowChanges_ re-checks before any write) and
  * _formulas (the formula text of each cell, '' for a plain value, so the
  * re-check can compare formula cells by text instead of by recalculated
- * value) and _volatileCols (see findVolatileColumns_). Every iterator over a
- * row skips "_"-prefixed keys.
+ * value) and _volatileCols (see findVolatileColumns_, plus any column named in
+ * MOVE_CHECK_SKIP_COLUMNS, see findMoveCheckSkipColumns_). Every iterator
+ * over a row skips "_"-prefixed keys.
  */
 function getUngradedRows_(sheet, headers, colMap) {
   var lastRow = sheet.getLastRow();
@@ -711,6 +724,16 @@ function getUngradedRows_(sheet, headers, colMap) {
   // and its column travel together, and then no data cell carries the text.
   var headerFormulas = sheet.getRange(1, 1, 1, headers.length).getFormulas();
   var volatileCols = findVolatileColumns_(headerFormulas.concat(formulas), headers.length);
+  // Columns the user exempted by header name get the same treatment as a
+  // detected volatile column: their formula-less cells are not value-compared.
+  var skipByName = findMoveCheckSkipColumns_(headers);
+  for (var s = 0; s < volatileCols.length; s++) {
+    if (skipByName.flags[s]) volatileCols[s] = true;
+  }
+  if (skipByName.unmatched.length) {
+    Logger.log('WARNING: MOVE_CHECK_SKIP_COLUMNS names "' + skipByName.unmatched.join('", "') +
+      '", which is not a ' + GRADER_CONFIG.DATA_SHEET + ' sheet header -- ignored. Check the spelling against row 1.');
+  }
   var statusIdx = colMap[GRADER_CONFIG.STATUS_COLUMN] - 1;
   var rows = [];
 
@@ -764,6 +787,31 @@ function findVolatileColumns_(formulas, width) {
     }
   }
   return flags;
+}
+
+/**
+ * Which columns GRADER_CONFIG.MOVE_CHECK_SKIP_COLUMNS exempts from the
+ * moved-row check: { flags, unmatched }, where `flags` is one boolean per
+ * entry of `headers` (true when that header, trimmed and lowercased, is
+ * listed) and `unmatched` lists the configured names that match no header, so
+ * the caller can say so instead of letting a typo do nothing. A duplicated
+ * header flags every column carrying it. Pure.
+ */
+function findMoveCheckSkipColumns_(headers) {
+  var names = GRADER_CONFIG.MOVE_CHECK_SKIP_COLUMNS || [];
+  var flags = [];
+  var seen = {};
+  for (var h = 0; h < headers.length; h++) {
+    var key = headers[h] === null || headers[h] === undefined ? '' : headers[h].toString().trim().toLowerCase();
+    var listed = key !== '' && names.indexOf(key) !== -1;
+    flags.push(listed);
+    if (listed) seen[key] = true;
+  }
+  var unmatched = [];
+  for (var n = 0; n < names.length; n++) {
+    if (!seen.hasOwnProperty(names[n]) && unmatched.indexOf(names[n]) === -1) unmatched.push(names[n]);
+  }
+  return { flags: flags, unmatched: unmatched };
 }
 
 /**
@@ -857,10 +905,10 @@ function buildMovedRowWarning_(moved, reached, colCounts, headers, notReached) {
     (notReached > 0 ? ' (' + notReached + ' more were not reached)' : '') + '. ' +
     'Columns that differed: ' + (parts.length ? parts.join(', ') : 'none recorded') + '. ' +
     'One sort or edit during a run is normal. If the same column is named run after run, ' +
-    'it changes on its own (a formula recalculating through a helper cell?). Either write ' +
-    'the volatile function into that column\'s own formula (NOW() itself, not a cell holding ' +
-    '=NOW()), or add a function that formula does use (ARRAYFORMULA, say) to ' +
-    'VOLATILE_FUNCTIONS; every column filled by one is then left out of the moved-row check.';
+    'it changes on its own (a formula recalculating through a helper cell?). Either add ' +
+    'that column\'s header to MOVE_CHECK_SKIP_COLUMNS, which leaves just that column out of ' +
+    'the moved-row check, or write the volatile function into its own formula (NOW() ' +
+    'itself, not a cell holding =NOW()).';
 }
 
 /**

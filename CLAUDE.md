@@ -55,7 +55,8 @@ directly, and `gradeNewRows` end to end against in-memory stand-ins for Sheets/f
 volatile formula column, formula-backed rows sorted mid-run, volatile `ARRAYFORMULA`
 spill column anchored in row 2 or in the header cell, each with and without a sort,
 an indirectly volatile spill that trips the most-rows-deferred warning, the same spill
-with `ARRAYFORMULA` added to `VOLATILE_FUNCTIONS` as the warning advises, a 200-row
+with its header listed in `MOVE_CHECK_SKIP_COLUMNS` as the warning advises and with
+`ARRAYFORMULA` added to `VOLATILE_FUNCTIONS`, a 200-row
 backlog on a fake clock — outlasting the timer budget with rows edited mid-call and
 with nothing moving, and skipped for one API call with that spill —
 and a Log sheet from before the `notes` column). Run it after touching
@@ -88,13 +89,15 @@ anything; add a scenario there when touching the loop or a failure path.
   to the `_snapshot` taken by `getUngradedRows_`, comparing cells that held a formula by
   their `_formulas` text instead of their value, and not comparing formula-less cells in
   a `_volatileCols` column (the spill of a volatile array formula, see
-  `findVolatileColumns_`); any difference skips the row (outcome `skipped`) so a sort
+  `findVolatileColumns_`, or a column named in `MOVE_CHECK_SKIP_COLUMNS`, see
+  `findMoveCheckSkipColumns_`); any difference skips the row (outcome `skipped`) so a sort
   mid-run can't put a grade on the wrong row, and a row already known to have changed
   isn't paid for.
 - Other helpers (all suffixed `_`, Apps Script's private convention):
   `resolveColumns_`, `getOrCreateCriteria_` / `parseCriteriaValues_`,
   `parseExcludeKeywords_` / `buildExcludeKeyword_`, `isGradableStatus_`,
-  `normalizeConfig_` (runs once at load), `getUngradedRows_` / `findVolatileColumns_`,
+  `normalizeConfig_` (runs once at load), `getUngradedRows_` / `findVolatileColumns_` /
+  `findMoveCheckSkipColumns_`,
   `findRowChanges_` / `findChangedColumns_` / `rowMatchesSnapshot_`, `findRowTitle_` /
   `hasTitleColumn_` / `guessRowTitle_`, `checkExcludeKeywords_`, `callLlmApi_`,
   `buildGradingPrompt_`, `parseGradeResponse_`, `updateRowGrade_`,
@@ -192,8 +195,10 @@ anything; add a scenario there when touching the loop or a failure path.
   has no moved-row protection. A spill whose volatility is *indirect*
   (`=ARRAYFORMULA($H$1-E2:E)` with `H1` holding `=NOW()`) names no volatile function
   and still defers every row after the first; matching on the volatile function's name
-  can't close that. The user can, by listing a function the column's formula does name
-  (`ARRAYFORMULA`) in `VOLATILE_FUNCTIONS`, which exempts every such column's spill. Those
+  can't close that. The user can: by listing the column's header in
+  `MOVE_CHECK_SKIP_COLUMNS` (exempts that column only, same per-column rule as
+  `_volatileCols`), or a function its formula does name (`ARRAYFORMULA`) in
+  `VOLATILE_FUNCTIONS` (exempts every such column's spill). Until they do, those
   rows are caught by the check before the API call, so they cost a sheet read each, not
   a call (2026-11-06 audit), but the backlog still only shrinks by one row a run. What
   the run does about that is say so: when more than `MOVED_ROW_WARN_RATIO` of the rows it
@@ -252,7 +257,13 @@ anything; add a scenario there when touching the loop or a failure path.
 - Changing the text of `buildMovedRowWarning_`? Every fix it names must work for the
   indirect spill it describes. "Add it to VOLATILE_FUNCTIONS" shipped meaning the
   volatile function, which `findVolatileColumns_` can never see in that column's
-  formula (2026-11-13 audit); the harness now runs the advice end to end.
+  formula (2026-11-13 audit). It now points at `MOVE_CHECK_SKIP_COLUMNS`, and the harness
+  runs that advice end to end.
+- Changing `MOVE_CHECK_SKIP_COLUMNS` / `findMoveCheckSkipColumns_`? Its flags are merged
+  into `_volatileCols` in `getUngradedRows_`, so a listed column gets exactly the volatile
+  rule (formula-less cells skipped, formula cells still compared by text) and a sort is
+  still caught through the other columns. Keep the WARNING for a name that matches no
+  header: a typo that silently does nothing is the failure this setting exists to end.
 - Changing `updateRowGrade_`? It takes a `cols` object (`{ gradeCol, reasoningCol,
   statusCol }`), not three separate args.
 - Changing which rows a run picks up? Edit `STATUSES_TO_GRADE` (currently `new` +
